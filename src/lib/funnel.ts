@@ -1,0 +1,676 @@
+import { sql, dbMode, type Row } from "./db";
+import { generate, generateJson, geminiModel, parseJson } from "./gemini";
+import { captureLesson, detachLesson, feedbackStats, markSent, retrieveLessons, segmentOf } from "./feedback";
+import { deliver, resendLive, testRecipients } from "./mailer";
+import { googleAccount, googleConfigured } from "./google";
+import { forgetApiTest, knownStatus, requireApis } from "./health";
+import { schedulingSnapshot, startThread } from "./scheduler";
+import { describeOpen, findContactsOnWebsite, qualifyFromWebsite, rankTitle, researchPerson, type Person, type PersonResearch } from "./research";
+
+// The basic funnel: ICP -> discover -> score/shortlist -> POC + pain points
+// -> draft -> human edit -> send. Companies without enough information are
+// researched by the scraper (scraper.ts, research.ts). Human edits to drafts
+// feed the feedback loop (feedback.ts). Evals are not built yet.
+
+export const SHORTLIST_THRESHOLD = 70;
+
+export type Settings = { icp: string; product: string; senderName: string; senderTitle: string };
+
+const DEFAULT_SETTINGS: Settings = {
+  icp: "SaaS companies, typically Series A-C, that are either preparing for a compliance audit or are under pressure from enterprise customers to get certified.",
+  product: "Sprinto automates compliance certifications - SOC 2, ISO 27001, GDPR - for SaaS companies.",
+  senderName: "",
+  senderTitle: "",
+};
+
+export async function getSettings(): Promise<Settings> {
+  const rows = await sql(`SELECT value FROM settings WHERE key = 'funnel'`);
+  return { ...DEFAULT_SETTINGS, ...(rows[0]?.value ?? {}) };
+}
+
+export async function saveSettings(patch: Partial<Settings>): Promise<Settings> {
+  const next = { ...(await getSettings()), ...patch };
+  await sql(
+    `INSERT INTO settings (key, value) VALUES ('funnel', $1::jsonb)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+    [JSON.stringify(next)],
+  );
+  return next;
+}
+
+export async function getState() {
+  const [settings, companies, contacts, drafts, edits, lessons, feedback, scheduling] = await Promise.all([
+    getSettings(),
+    sql(`SELECT * FROM companies ORDER BY fit_score DESC NULLS LAST, id DESC`),
+    sql(`SELECT * FROM contacts`),
+    sql(`SELECT * FROM drafts`),
+    sql(`SELECT count(*)::int AS n FROM draft_edits`),
+    sql(`SELECT * FROM lessons WHERE draft_id IS NOT NULL`),
+    feedbackStats(),
+    schedulingSnapshot(),
+  ]);
+  const google = { configured: googleConfigured(), email: await googleAccount() };
+  const withLesson = (d: Row | undefined) => (d ? { ...d, lesson: lessons.find((l) => l.draft_id === d.id) ?? null } : null);
+  return {
+    settings,
+    companies: companies.map((c) => ({
+      ...c,
+      contact: contacts.find((p) => p.company_id === c.id) ?? null,
+      draft: withLesson(drafts.find((d) => d.company_id === c.id)),
+      thread: scheduling.threads.find((t) => t.company_id === c.id) ?? null,
+    })),
+    notifications: scheduling.notifications,
+    calendar: scheduling.calendar,
+    rules: scheduling.rules,
+    editsLogged: edits[0]?.n ?? 0,
+    feedback,
+    config: {
+      db: dbMode(),
+      model: geminiModel(),
+      hunter: !!process.env.HUNTER_API_KEY,
+      resend: resendLive(),
+      google,
+      testRecipient: testRecipients().join(", ") || null,
+    },
+    apis: knownStatus(),
+  };
+}
+
+function cleanDomain(value: string): string {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .split(/[/?#]/)[0]
+    .trim();
+}
+
+async function getCompany(id: number): Promise<Row> {
+  const rows = await sql(`SELECT * FROM companies WHERE id = $1`, [id]);
+  if (!rows[0]) throw new Error("Company not found");
+  return rows[0];
+}
+
+function companyFacts(c: Row): string {
+  return [
+    `Name: ${c.name}`,
+    `Website: ${c.domain}`,
+    `What they do: ${c.description ?? "unknown"}`,
+    `Funding stage: ${c.funding_stage ?? "unknown"} (${c.last_funding ?? "no round details"})`,
+    `HQ: ${c.hq ?? "unknown"}`,
+    `Employees: ${c.employees ?? "unknown"}`,
+    `Target markets / customers: ${c.target_markets ?? "unknown"}`,
+    `Certifications already held: ${c.certifications_held ?? "unknown"}`,
+    `Signals: ${(c.signals ?? []).join("; ") || "none found"}`,
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------- discovery
+
+type Found = {
+  name: string;
+  domain: string;
+  description?: string;
+  funding_stage?: string;
+  last_funding?: string;
+  hq?: string;
+  employees?: string;
+  target_markets?: string;
+  certifications_held?: string;
+  signals?: string[];
+};
+
+type Score = {
+  domain: string;
+  fit_score: number;
+  fit_reason: string;
+  recommended_framework: string;
+  info_sufficient: boolean;
+  missing_info?: string;
+};
+
+async function scoreCompanies(settings: Settings, found: Found[]): Promise<Score[]> {
+  const { data } = await generateJson<Score[] | Score>(
+    `Score each company against this ICP for the seller described.
+
+Seller: ${settings.product}
+ICP: ${settings.icp}
+
+Scoring rubric (0-100):
+- Must be a SaaS company. If it is not, score below 20.
+- Funding stage Series A-C is the sweet spot. Seed or Series D+ lowers the score.
+- Intent matters most: evidence they are preparing for a compliance audit, or are under enterprise
+  customer pressure to get certified. Strong evidence = high score. No evidence = at most 55.
+- Already holding the relevant certifications lowers the score sharply.
+- Judge only from the facts given. Where facts are "unknown", do not assume them.
+
+Set info_sufficient to false when the facts are too thin to judge ICP fit confidently, and say in
+missing_info exactly what is missing (these companies will be sent to a scraper for more data).
+recommended_framework is the one certification to lead with: "SOC 2" (selling to US enterprise),
+"ISO 27001" (EU / international enterprise) or "GDPR" (processing EU personal data).
+fit_reason is 1-2 plain sentences citing the specific facts behind the score.
+
+Companies:
+${JSON.stringify(found, null, 1)}
+
+Return a JSON array with one item per company:
+{"domain": string, "fit_score": number, "fit_reason": string, "recommended_framework": string,
+ "info_sufficient": boolean, "missing_info": string}`,
+    { temperature: 0.1 },
+  );
+  return Array.isArray(data) ? data : [data];
+}
+
+export async function discoverCompanies(count: number) {
+  const settings = await getSettings();
+  const known = (await sql(`SELECT domain FROM companies`)).map((r) => r.domain);
+
+  // Step 1: find candidates with live Google Search.
+  const search = await generate(
+    `You are a B2B sales researcher for this company:
+${settings.product}
+
+Ideal customer profile (ICP):
+${settings.icp}
+
+Use Google Search to find ${count} real companies that match this ICP right now. Prioritise companies showing
+intent signals such as: a recent Series A-C round, moving upmarket to enterprise customers, hiring for
+security/compliance/GRC roles, selling into regulated industries (fintech, healthtech, HR, legal), handling
+sensitive customer data, expanding into the US or EU, or publicly stating a certification is "in progress".
+Prefer companies that do NOT already hold SOC 2 / ISO 27001.
+${known.length ? `Do not return any of these, they are already in the list: ${known.join(", ")}.` : ""}
+
+Only state facts you found. If you could not find a fact, write "unknown" - never guess.
+
+Return ONLY a JSON array, no prose, where each item is:
+{"name": string, "domain": "example.com", "description": one sentence on what the product does,
+ "funding_stage": "Seed" | "Series A" | "Series B" | "Series C" | "Series D+" | "unknown",
+ "last_funding": e.g. "$20M Series A, March 2026" or "unknown", "hq": "City, Country",
+ "employees": e.g. "51-200" or "unknown", "target_markets": who they sell to and in which regions,
+ "certifications_held": e.g. "none found" or "SOC 2 Type II",
+ "signals": [short factual intent signals, each with its date or source where known]}`,
+    { search: true, temperature: 0.3, fast: true },
+  );
+
+  const found = parseJson<Found[]>(search.text)
+    .map((f) => ({ ...f, domain: cleanDomain(f.domain) }))
+    .filter((f) => f.name && f.domain && !known.includes(f.domain));
+  if (found.length === 0) return { added: 0 };
+
+  // Step 2: score each candidate against the ICP.
+  const scores = await scoreCompanies(settings, found);
+
+  let added = 0;
+  for (const f of found) {
+    const s = scores.find((x) => cleanDomain(x.domain) === f.domain);
+    const score = s ? Math.max(0, Math.min(100, Math.round(Number(s.fit_score) || 0))) : null;
+    const rows = await sql(
+      `INSERT INTO companies (name, domain, description, funding_stage, last_funding, hq, employees,
+         target_markets, certifications_held, signals, sources, fit_score, fit_reason,
+         recommended_framework, info_sufficient, missing_info, status, scrape_status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13,$14,$15,$16,$17,$18)
+       ON CONFLICT (domain) DO NOTHING RETURNING id`,
+      [
+        f.name, f.domain, f.description ?? null, f.funding_stage ?? null, f.last_funding ?? null,
+        f.hq ?? null, f.employees ?? null, f.target_markets ?? null, f.certifications_held ?? null,
+        JSON.stringify(f.signals ?? []), JSON.stringify(search.sources.slice(0, 12)),
+        score, s?.fit_reason ?? null, s?.recommended_framework ?? null,
+        s?.info_sufficient ?? false, s?.missing_info ?? null,
+        score !== null && score >= SHORTLIST_THRESHOLD ? "shortlisted" : "candidate",
+        // Not enough information to judge fit: queue the company for the scraper.
+        s?.info_sufficient ? "none" : "pending",
+      ],
+    );
+    added += rows.length;
+  }
+  return { added };
+}
+
+export async function setCompanyStatus(id: number, status: string) {
+  if (!["candidate", "shortlisted", "rejected"].includes(status)) throw new Error("Invalid status");
+  await sql(`UPDATE companies SET status = $1 WHERE id = $2`, [status, id]);
+}
+
+export async function deleteCompany(id: number) {
+  await sql(`DELETE FROM companies WHERE id = $1`, [id]);
+}
+
+// ------------------------------------------------------------------ scraper
+
+/** The Growth Lead's own list of company websites. Each one is queued for the scraper. */
+export async function addCompanies(websites: string[]) {
+  let added = 0;
+  for (const domain of [...new Set(websites.map(cleanDomain))]) {
+    if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(domain)) continue;
+    const rows = await sql(
+      `INSERT INTO companies (name, domain, info_sufficient, missing_info, scrape_status)
+       VALUES ($1, $1, FALSE, 'Not researched yet', 'pending')
+       ON CONFLICT (domain) DO NOTHING RETURNING id`,
+      [domain],
+    );
+    added += rows.length;
+  }
+  return { added };
+}
+
+const EXIT_TEXT: Record<string, string> = {
+  decided: "Every question was answered.",
+  not_saas: "Stopped early: this is not a SaaS company.",
+  sources_exhausted: "Stopped: every relevant page was tried.",
+  page_limit: "Stopped: page limit reached.",
+  request_limit: "Stopped: request limit reached.",
+  time_limit: "Stopped: time limit reached.",
+  site_unreachable: "The website could not be reached.",
+};
+
+/**
+ * Researches one company from its website, then scores it. The scraper reads
+ * the homepage and fetches further named pages only while a question about ICP
+ * fit is still open. Whatever the exit, the company still gets an answer.
+ */
+export async function scrapeCompany(id: number) {
+  const company = await getCompany(id);
+  const settings = await getSettings();
+  try {
+    const result = await qualifyFromWebsite(company, settings);
+    const f = result.facts;
+    const keep = (next: string | undefined, current: string | null) =>
+      next && !/^(unknown|n\/a)$/i.test(next.trim()) ? next : current;
+    const merged = {
+      name: f?.name && company.name === company.domain ? f.name : company.name,
+      domain: company.domain,
+      description: keep(f?.description, company.description) ?? undefined,
+      funding_stage: keep(f?.funding_stage, company.funding_stage) ?? "unknown",
+      last_funding: keep(f?.last_funding, company.last_funding) ?? "unknown",
+      hq: keep(f?.hq, company.hq) ?? "unknown",
+      employees: keep(f?.employees, company.employees) ?? "unknown",
+      target_markets: keep(f?.target_markets, company.target_markets) ?? "unknown",
+      certifications_held: keep(f?.certifications_held, company.certifications_held) ?? "unknown",
+      signals: [...new Set([...(f?.signals ?? []), ...(company.signals ?? [])])].slice(0, 8),
+    };
+
+    const summary = {
+      exitReason: result.exitReason,
+      exitText: EXIT_TEXT[result.exitReason],
+      steps: result.steps,
+      pagesRead: result.pagesRead,
+      requests: result.requests,
+      durationMs: result.durationMs,
+      isSaas: f?.is_saas ?? "unknown",
+      compliancePressure: f?.compliance_pressure ?? "no_evidence",
+    };
+    const missing = result.decided ? null : `${EXIT_TEXT[result.exitReason]} Still unknown: ${describeOpen(result.open)}.`;
+
+    // The system still has to answer, even on a forced exit: score with what it has.
+    let score: Score | undefined;
+    if (result.exitReason === "not_saas") {
+      score = { domain: company.domain, fit_score: 10, fit_reason: `Not a SaaS company: ${merged.description ?? "see website"}`, recommended_framework: "", info_sufficient: true };
+    } else if (f) {
+      score = (await scoreCompanies(settings, [{ ...merged, is_saas: f.is_saas, compliance_pressure: f.compliance_pressure } as Found]))[0];
+    }
+    const fit = score ? Math.max(0, Math.min(100, Math.round(Number(score.fit_score) || 0))) : company.fit_score;
+
+    await sql(
+      `UPDATE companies SET name=$1, description=$2, funding_stage=$3, last_funding=$4, hq=$5, employees=$6,
+         target_markets=$7, certifications_held=$8, signals=$9::jsonb, fit_score=$10, fit_reason=$11,
+         recommended_framework=$12, info_sufficient=$13, missing_info=$14, status=$15,
+         scrape_status='done', scrape_summary=$16::jsonb
+       WHERE id=$17`,
+      [
+        merged.name, merged.description ?? null, merged.funding_stage, merged.last_funding, merged.hq, merged.employees,
+        merged.target_markets, merged.certifications_held, JSON.stringify(merged.signals),
+        fit, score?.fit_reason ?? company.fit_reason, score?.recommended_framework || company.recommended_framework,
+        result.decided, missing,
+        company.status === "rejected" ? "rejected" : fit !== null && fit >= SHORTLIST_THRESHOLD ? "shortlisted" : "candidate",
+        JSON.stringify(summary), id,
+      ],
+    );
+    return { exitReason: result.exitReason, pagesRead: result.pagesRead };
+  } catch (err) {
+    // Never leave a company stuck in "pending": that would re-queue it forever.
+    await sql(`UPDATE companies SET scrape_status='failed', scrape_summary=$1::jsonb WHERE id=$2`, [
+      JSON.stringify({ exitReason: "error", exitText: `Scrape failed: ${(err as Error).message}`, steps: [] }), id,
+    ]);
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------- POC
+
+type HunterProfile = {
+  organization: string | null; description: string | null; industry: string | null; headcount: string | null;
+  company_type: string | null; location: string | null; technologies: string[]; linkedin: string | null;
+};
+
+async function hunterDomainSearch(domain: string, filters: Record<string, string>): Promise<{ people: Person[]; profile: HunterProfile }> {
+  const query = new URLSearchParams({ domain, limit: "10", type: "personal", ...filters });
+  const res = await fetch(`https://api.hunter.io/v2/domain-search?${query}`, {
+    headers: { "X-API-KEY": process.env.HUNTER_API_KEY! },
+    signal: AbortSignal.timeout(30_000),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    forgetApiTest("hunter");
+    throw new Error(`Hunter.io: ${data?.errors?.[0]?.details ?? `HTTP ${res.status}`}`);
+  }
+  const d: Row = data?.data ?? {};
+  const people: Person[] = (d.emails ?? [])
+    .filter((e: Row) => e.value && e.first_name)
+    .map((e: Row) => ({
+      first_name: e.first_name ?? "",
+      last_name: e.last_name ?? "",
+      title: e.position ?? "",
+      email: e.value,
+      confidence: e.confidence ?? null,
+      linkedin: e.linkedin ?? null,
+      seniority: e.seniority ?? null,
+      department: e.department ?? null,
+      sourceUrls: (e.sources ?? []).filter((x: Row) => x.still_on_page !== false && x.uri).map((x: Row) => x.uri),
+    }));
+  // The same response carries Hunter's company profile, at no extra credit.
+  const profile: HunterProfile = {
+    organization: d.organization ?? null, description: d.description ?? null, industry: d.industry ?? null,
+    headcount: d.headcount ?? null, company_type: d.company_type ?? null,
+    location: [d.city, d.state, d.country].filter(Boolean).join(", ") || null,
+    technologies: Array.isArray(d.technologies) ? d.technologies : [], linkedin: d.linkedin ?? null,
+  };
+  return { people, profile };
+}
+
+/**
+ * Everyone Hunter.io has for the domain, best contact first, plus its company
+ * profile. Each Hunter call costs a credit, so:
+ *  - the answer is cached per domain and reused on every later lookup;
+ *  - it first asks only for senior people in the departments that own
+ *    compliance, and widens to everyone only when that returns nobody.
+ */
+async function hunterSearch(domain: string): Promise<{ people: Person[]; profile: HunterProfile | null; cached: boolean }> {
+  const hit = (await sql(`SELECT people, profile FROM hunter_cache WHERE domain = $1`, [domain]))[0];
+  if (hit) return { people: hit.people, profile: hit.profile, cached: true };
+
+  // About to spend a credit: make sure the key works and credits are left first.
+  await requireApis(["hunter"]);
+  let result = await hunterDomainSearch(domain, { seniority: "senior,executive", department: "it,executive,management" });
+  if (result.people.length === 0) result = await hunterDomainSearch(domain, {});
+  result.people.sort((a, b) => rankTitle(a.title) - rankTitle(b.title) || (b.confidence ?? 0) - (a.confidence ?? 0));
+  await sql(
+    `INSERT INTO hunter_cache (domain, people, profile) VALUES ($1, $2::jsonb, $3::jsonb)
+     ON CONFLICT (domain) DO UPDATE SET people = EXCLUDED.people, profile = EXCLUDED.profile, fetched_at = now()`,
+    [domain, JSON.stringify(result.people), JSON.stringify(result.profile)],
+  );
+  return { ...result, cached: false };
+}
+
+// Compliance tools that show the company already has a vendor.
+const COMPETITORS = /vanta|drata|secureframe|thoropass|scrut|scytale|hyperproof|anecdotes/i;
+
+/** Merges Hunter's company profile into the company record, filling gaps only. */
+async function applyProfile(company: Row, profile: HunterProfile | null) {
+  if (!profile) return;
+  const blank = (v: unknown) => !v || /^unknown$/i.test(String(v));
+  const signals: string[] = [...(company.signals ?? [])];
+  const rival = profile.technologies.find((t) => COMPETITORS.test(t));
+  if (rival && !signals.some((x) => x.includes(rival))) signals.push(`Already uses a compliance tool: ${rival} (Hunter.io)`);
+  await sql(`UPDATE companies SET profile = $1::jsonb, employees = $2, hq = $3, signals = $4::jsonb WHERE id = $5`, [
+    JSON.stringify(profile),
+    blank(company.employees) && profile.headcount ? profile.headcount : company.employees,
+    blank(company.hq) && profile.location ? profile.location : company.hq,
+    JSON.stringify(signals), company.id,
+  ]);
+}
+
+async function hunterEmailFinder(domain: string, person: Person): Promise<{ email: string; confidence: number | null } | null> {
+  const query = new URLSearchParams({ domain, first_name: person.first_name, last_name: person.last_name });
+  const res = await fetch(`https://api.hunter.io/v2/email-finder?${query}`, {
+    headers: { "X-API-KEY": process.env.HUNTER_API_KEY! },
+    signal: AbortSignal.timeout(30_000),
+  }).catch(() => null);
+  const data = res?.ok ? await res.json().catch(() => null) : null;
+  return data?.data?.email ? { email: data.data.email, confidence: data.data.score ?? null } : null;
+}
+
+/** What may be said about the person: only facts that were verified against a fetched source. */
+function personNotes(research: PersonResearch | null | undefined): string {
+  const verified = (research?.facts ?? []).filter((f) => typeof f === "object" && f.verified);
+  if (verified.length === 0) return "nothing verified beyond their title";
+  return verified.map((f) => `- ${f.text}`).join("\n");
+}
+
+async function painPoints(company: Row, title: string, settings: Settings, research: PersonResearch | null): Promise<string[]> {
+  const { data } = await generateJson<{ pain_points: string[] }>(
+    `Seller: ${settings.product}
+
+Prospect company:
+${companyFacts(company)}
+
+The person we will email holds this role: ${title || "senior leader responsible for security/compliance"}.
+What we know about this person:
+${personNotes(research)}
+
+Give exactly two pain points this specific person is likely feeling right now about compliance
+certification (${company.recommended_framework ?? "SOC 2 / ISO 27001 / GDPR"}). Each must be tied to
+their role AND to a concrete fact about this company above - not generic compliance pain. Where what we
+know about the person makes a pain more specific (their remit, their background), use it.
+Each is one sentence, under 30 words.
+
+Return JSON: {"pain_points": [string, string]}`,
+    { temperature: 0.4 },
+  );
+  return (data.pain_points ?? []).slice(0, 2);
+}
+
+export async function findPoc(companyId: number) {
+  const company = await getCompany(companyId);
+  const settings = await getSettings();
+
+  let person: Person | null = null;
+  let source = "mock";
+  if (process.env.HUNTER_API_KEY) {
+    const hunter = await hunterSearch(company.domain);
+    await applyProfile(company, hunter.profile);
+    person = hunter.people[0] ?? null;
+    source = "hunter";
+  }
+  if (!person) {
+    // Hunter.io has nobody for this company (or is not connected): look for a
+    // named person on the company's own website with the scraper.
+    const scraped = await findContactsOnWebsite(company);
+    person = scraped.people[0] ?? null;
+    source = "scraped";
+    // A name without an email: ask Hunter for that specific person's address.
+    if (person && !person.email && process.env.HUNTER_API_KEY) {
+      const found = await hunterEmailFinder(company.domain, person);
+      if (found) person = { ...person, ...found };
+    }
+  }
+  if (!person) {
+    // Nothing anywhere: a clearly fake placeholder so the rest of the funnel can
+    // be exercised. Sending to a placeholder contact is blocked in sendDraft.
+    person = { first_name: "Sample", last_name: "Contact", title: "CTO (placeholder)", email: `placeholder@${company.domain}`, confidence: null };
+    source = "mock";
+  }
+  await researchAndSave(company, settings, person, source);
+}
+
+/** Researches the person (unless they are a placeholder), works out their pain points and saves the contact. */
+async function researchAndSave(company: Row, settings: Settings, person: Person, source: string) {
+  // A research failure must not lose the contact, so it degrades to "nothing found".
+  let research: PersonResearch | null = null;
+  if (source !== "mock") {
+    research = await researchPerson(company, person).catch((err) => {
+      console.error("Person research failed:", err);
+      return null;
+    });
+  }
+
+  const pains = await painPoints(company, person.title.replace(" (placeholder)", ""), settings, research);
+  await sql(
+    `INSERT INTO contacts (company_id, first_name, last_name, title, email, confidence, source, pain_points, linkedin, research)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10::jsonb)
+     ON CONFLICT (company_id) DO UPDATE SET first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name,
+       title = EXCLUDED.title, email = EXCLUDED.email, confidence = EXCLUDED.confidence,
+       source = EXCLUDED.source, pain_points = EXCLUDED.pain_points, linkedin = EXCLUDED.linkedin,
+       research = EXCLUDED.research`,
+    [company.id, person.first_name, person.last_name, person.title, person.email, person.confidence, source, JSON.stringify(pains), person.linkedin ?? null, research ? JSON.stringify(research) : null],
+  );
+}
+
+/** Re-runs the research and pain points for the contact already on file. Uses no Hunter.io credits. */
+export async function researchPoc(companyId: number) {
+  const company = await getCompany(companyId);
+  const contact = (await sql(`SELECT * FROM contacts WHERE company_id = $1`, [companyId]))[0];
+  if (!contact) throw new Error("Find the POC first");
+  if (contact.source === "mock") throw new Error("This is a placeholder contact, there is nobody to research");
+  const cached = (await sql(`SELECT people FROM hunter_cache WHERE domain = $1`, [company.domain]))[0];
+  const known = (cached?.people ?? []).find((p: Person) => p.email && p.email === contact.email);
+  const earlier: string[] = (contact.research?.steps ?? [])
+    .filter((s: Row) => s.source === "contact_source" && typeof s.url === "string" && s.url.startsWith("http"))
+    .map((s: Row) => s.url);
+  await researchAndSave(company, await getSettings(), {
+    first_name: contact.first_name, last_name: contact.last_name, title: contact.title, email: contact.email,
+    confidence: contact.confidence, linkedin: contact.linkedin, sourceUrls: known?.sourceUrls ?? earlier.slice(0, 2),
+  }, contact.source);
+}
+
+/** Lets the human correct or enter the POC by hand. A hand-edited contact counts as real. */
+export async function updateContact(id: number, patch: Row) {
+  const rows = await sql(`SELECT * FROM contacts WHERE id = $1`, [id]);
+  if (!rows[0]) throw new Error("Contact not found");
+  const c = { ...rows[0], ...patch };
+  await sql(
+    `UPDATE contacts SET first_name = $1, last_name = $2, title = $3, email = $4, source = 'manual' WHERE id = $5`,
+    [c.first_name, c.last_name, c.title, c.email, id],
+  );
+}
+
+// -------------------------------------------------------------------- draft
+
+export async function draftEmail(companyId: number) {
+  const company = await getCompany(companyId);
+  const settings = await getSettings();
+  const contact = (await sql(`SELECT * FROM contacts WHERE company_id = $1`, [companyId]))[0];
+  if (!contact) throw new Error("Find the POC before drafting the email");
+
+  // Feedback loop, retrieve + apply: lessons from past human edits for
+  // prospects with a similar ICP profile go into the prompt.
+  const learned = await retrieveLessons(segmentOf(company, contact));
+  const { data } = await generateJson<{ subject: string; hook: string; cta: string; body: string }>(
+    `Write a cold outreach email.
+
+Seller: ${settings.product}
+Sender: ${settings.senderName || "[Your name]"}${settings.senderTitle ? `, ${settings.senderTitle}` : ""} at Sprinto
+
+Recipient: ${contact.first_name} ${contact.last_name}, ${String(contact.title).replace(" (placeholder)", "")} at ${company.name}
+
+About their company:
+${companyFacts(company)}
+
+What we know about the recipient:
+${personNotes(contact.research)}
+
+Why they fit: ${company.fit_reason ?? "matches the ICP"}
+Certification to lead with: ${company.recommended_framework ?? "SOC 2"}
+
+Their two pain points:
+${(contact.pain_points ?? []).map((p: string, i: number) => `${i + 1}. ${p}`).join("\n")}
+
+${learned.promptBlock}
+Rules:
+- Open with "Hi ${contact.first_name}," then a hook: one sentence about a specific, real fact about
+  THEIR company from above (a funding round, a hire, a launch, a market move). Never open with
+  "I hope this finds you well", "I came across", or by introducing the sender.
+- Weave in both pain points naturally, in their words, not as a list.
+- Write for this person's seniority and remit. You may reference one thing we know about them if it is
+  clearly relevant to compliance, but never say where it was found and never sound like you researched them.
+- One or two sentences on how Sprinto removes that pain. No feature lists, no buzzwords.
+- End with one low-friction question as the call to action.
+- 90-130 words, plain text, short paragraphs, sounds like one human writing to another.
+- No exclamation marks, no emojis, no placeholders other than the sender name if it is unknown.
+- Use only facts given above. Never invent customers, numbers or events.
+- Sign off with the sender's name.
+- Subject: under 7 words, lowercase-style, specific to them, not salesy.
+
+Return JSON: {"subject": string, "hook": the hook sentence on its own, "cta": the closing question on its own,
+ "body": the full email text}`,
+    { temperature: 0.7 },
+  );
+
+  // The lesson from the draft being replaced is kept, but no longer tied to it.
+  await detachLesson(companyId);
+  await sql(
+    `INSERT INTO drafts (company_id, contact_id, hook, cta, subject, body, original_subject, original_body, original_hook, original_cta, applied_lessons)
+     VALUES ($1,$2,$3,$4,$5,$6,$5,$6,$3,$4,$7::jsonb)
+     ON CONFLICT (company_id) DO UPDATE SET contact_id = EXCLUDED.contact_id, hook = EXCLUDED.hook, cta = EXCLUDED.cta,
+       subject = EXCLUDED.subject, body = EXCLUDED.body, original_subject = EXCLUDED.original_subject,
+       original_body = EXCLUDED.original_body, original_hook = EXCLUDED.original_hook, original_cta = EXCLUDED.original_cta,
+       applied_lessons = EXCLUDED.applied_lessons, feedback = '', status = 'draft', sent_at = NULL, provider_id = NULL,
+       updated_at = now()`,
+    [companyId, contact.id, data.hook ?? "", data.cta ?? "", data.subject, data.body, JSON.stringify(learned.applied)],
+  );
+}
+
+/**
+ * Saves the human's changes. Whenever the email text actually changes, the
+ * before/after pair and the written feedback are logged to draft_edits, and
+ * the feedback loop captures what was changed.
+ */
+export async function saveDraft(id: number, patch: { subject?: string; body?: string; feedback?: string }) {
+  const rows = await sql(`SELECT * FROM drafts WHERE id = $1`, [id]);
+  const draft = rows[0];
+  if (!draft) throw new Error("Draft not found");
+  if (draft.status !== "draft") throw new Error("This email has already been sent and can no longer be edited");
+
+  const subject = patch.subject ?? draft.subject;
+  const body = patch.body ?? draft.body;
+  const feedback = patch.feedback ?? draft.feedback;
+  const textChanged = subject !== draft.subject || body !== draft.body;
+
+  await sql(`UPDATE drafts SET subject = $1, body = $2, feedback = $3, updated_at = now() WHERE id = $4`, [subject, body, feedback, id]);
+  if (textChanged) {
+    await sql(
+      `INSERT INTO draft_edits (draft_id, before_subject, before_body, after_subject, after_body, feedback)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [id, draft.subject, draft.body, subject, body, feedback],
+    );
+  }
+
+  // Feedback loop trigger: any change to the email or to the written feedback
+  // re-captures the lesson for this draft. A capture failure must not lose the save.
+  let learned = 0;
+  let captureError: string | null = null;
+  if (textChanged || feedback !== draft.feedback) {
+    try {
+      learned = (await captureLesson(id)).learned;
+    } catch (err) {
+      console.error("Feedback capture failed:", err);
+      captureError = (err as Error).message;
+    }
+  }
+  return { editLogged: textChanged, learned, captureError };
+}
+
+// --------------------------------------------------------------------- send
+
+/**
+ * The human pressed send. The email goes out through the recipient lock in
+ * mailer.ts, and the after-send conversation (scheduler.ts) starts for this
+ * company. While the lock is on, the draft stays open so it can be edited and
+ * sent again.
+ */
+export async function sendDraft(id: number) {
+  const draft = (await sql(`SELECT * FROM drafts WHERE id = $1`, [id]))[0];
+  if (!draft) throw new Error("Draft not found");
+  if (draft.status !== "draft") throw new Error("This email has already been sent");
+  const contact = (await sql(`SELECT * FROM contacts WHERE id = $1`, [draft.contact_id]))[0];
+  if (testRecipients().length === 0 && contact?.source === "mock") {
+    throw new Error("This is a placeholder contact. Find or enter the real POC before sending.");
+  }
+
+  const result = await deliver({ subject: draft.subject, body: draft.body, prospectEmail: contact?.email ?? null });
+  await markSent(id);
+  if (result.mode === "live") await sql(`UPDATE drafts SET status = 'sent', sent_at = now() WHERE id = $1`, [id]);
+  if (result.mode === "simulated") await sql(`UPDATE drafts SET status = 'simulated', sent_at = now() WHERE id = $1`, [id]);
+  const sentTo = result.mode === "simulated" ? "simulated, Resend not connected" : `to ${result.delivered.join(", ")}${result.gmail ? " from Gmail" : ""}`;
+  await startThread(draft.company_id, draft.subject, draft.body, sentTo, result.gmail);
+  return { status: result.mode === "live" ? "sent" : result.mode, to: result.delivered.join(", "), failed: result.failed };
+}
