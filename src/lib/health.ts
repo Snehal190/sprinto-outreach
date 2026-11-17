@@ -108,15 +108,6 @@ export async function testAllApis(force = false): Promise<ApiStatus[]> {
   return Promise.all((Object.keys(LABEL) as ApiName[]).map((api) => testApi(api, force)));
 }
 
-/** Last known results, without calling anything. Unknown APIs are tested in the background. */
-export function knownStatus(): ApiStatus[] {
-  return (Object.keys(LABEL) as ApiName[]).map((api) => {
-    const hit = cache.get(api);
-    if (!hit || Date.now() - hit.at > PASS_FOR_MS) void testApi(api);
-    return hit?.status ?? pending(api);
-  });
-}
-
 /** A real call to this API failed: forget the cached result so the next step tests it again. */
 export function forgetApiTest(api: ApiName) {
   cache.delete(api);

@@ -3,7 +3,7 @@ import { generate, generateJson, geminiModel, parseJson } from "./gemini";
 import { captureLesson, detachLesson, feedbackStats, markSent, retrieveLessons, segmentOf } from "./feedback";
 import { deliver, resendLive, testRecipients } from "./mailer";
 import { googleAccount, googleConfigured } from "./google";
-import { forgetApiTest, knownStatus, requireApis } from "./health";
+import { forgetApiTest, requireApis, testAllApis } from "./health";
 import { schedulingSnapshot, startThread } from "./scheduler";
 import { describeOpen, findContactsOnWebsite, qualifyFromWebsite, rankTitle, researchPerson, type Person, type PersonResearch } from "./research";
 
@@ -72,7 +72,7 @@ export async function getState() {
       google,
       testRecipient: testRecipients().join(", ") || null,
     },
-    apis: knownStatus(),
+    apis: await testAllApis(),
   };
 }
 
