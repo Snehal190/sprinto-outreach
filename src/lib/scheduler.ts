@@ -3,6 +3,7 @@ import { converse, generateJson, type Content, type Part, type ToolDeclaration }
 import { deliver, testRecipients } from "./mailer";
 import { calendarCancel, gmailReplies, googleAccount, type GmailSent } from "./google";
 import { mailApi, requireApis } from "./health";
+import { getSettings } from "./icp";
 import { MEETING_MINUTES, WORK_END_HOUR, WORK_START_HOUR, bookMeeting, checkCalendar, formatIst, parseIst, toIstInput, upcomingEvents, type Meeting } from "./calendar";
 
 // What happens after the outreach email is sent.
@@ -140,9 +141,9 @@ async function flagHuman(thread: Thread, reason: string, who: string) {
 async function context(thread: Thread) {
   const company = (await sql(`SELECT * FROM companies WHERE id = $1`, [thread.company_id]))[0] ?? {};
   const contact = (await sql(`SELECT * FROM contacts WHERE company_id = $1`, [thread.company_id]))[0] ?? {};
-  const settings = (await sql(`SELECT value FROM settings WHERE key = 'funnel'`))[0]?.value ?? {};
+  const settings = await getSettings();
   const who = `${contact.first_name ?? "The prospect"} ${contact.last_name ?? ""}`.trim() + (company.name ? ` (${company.name})` : "");
-  return { company, contact, sender: (settings.senderName as string) || "the sender", product: (settings.product as string) || "", who };
+  return { company, contact, sender: settings.senderName || "the sender", seller: settings.companyName, product: `${settings.companyName}: ${settings.product}`, who };
 }
 
 /** Sends an email in the thread, through the recipient lock, and logs it. Returns null on success or the error text. */
@@ -230,10 +231,12 @@ async function executeTool(name: string, args: Record<string, unknown>, thread: 
     const again = await checkCalendar(key, thread.id, MEETING_MINUTES, thread.meeting?.googleEventId);
     if (again.status !== "free") return { status: "rejected", reason: `no longer free: ${again.reason ?? again.status}` };
     const moved = !!thread.meeting;
-    thread.meeting = await bookMeeting(thread.id, key, `Sprinto x ${ctx.company.name ?? "prospect"}`, {
+    thread.meeting = await bookMeeting(thread.id, key, `${ctx.seller} x ${ctx.company.name ?? "prospect"}`, {
       attendees: await attendees(ctx.contact.email ?? null), previousEventId: thread.meeting?.googleEventId,
     });
     thread.state.meeting_status = "confirmed";
+    // The agreed time replaces the earlier proposals, so a moved meeting shows its new time.
+    thread.state.times_proposed = [thread.meeting.when];
     thread.state.calendar_checked = true;
     run.booked = true;
     run.emailedAfterBooking = false;
@@ -271,7 +274,7 @@ async function conversationText(threadId: number): Promise<string> {
 async function runAgent(thread: Thread, ctx: Awaited<ReturnType<typeof context>>, trigger: string, toolNames: string[]): Promise<Run> {
   const run: Run = { checked: new Map(), emails: 0, calls: 0, booked: false, emailedAfterBooking: false };
   const now = new Date();
-  const system = `You are the scheduling assistant for ${ctx.sender} at Sprinto, handling the email thread with ${ctx.who}, ${ctx.contact.title ?? "a prospect"}.
+  const system = `You are the scheduling assistant for ${ctx.sender} at ${ctx.seller}, handling the email thread with ${ctx.who}, ${ctx.contact.title ?? "a prospect"}.
 You decide what to do; tools do it. Act only through tools. When nothing more needs doing, reply with one short sentence saying what you did.
 
 Now: ${formatIst(now)} (${toIstInput(now)}). All times are IST. Meetings are ${MEETING_MINUTES} minutes and must sit between ${WORK_START_HOUR}:00 and ${WORK_END_HOUR}:00 IST.
@@ -293,7 +296,7 @@ Rules:
 - Work out relative times ("3:15 instead of 3", "tomorrow", "Thursday") from the current time, the proposed slots and the booked meeting.
 - Emails are plain text, under 80 words, warm and direct, addressed "Hi ${ctx.contact.first_name ?? "there"}," and signed "${ctx.sender}". Write times like "Tue 17 Nov, 3:15 PM IST".
 - Never invent a meeting link. Use only the link book_meeting returns.
-- Never invent statistics, customers, integrations or product claims. All you may say about the product is: ${ctx.product || "Sprinto automates compliance certifications for SaaS companies."}`;
+- Never invent statistics, customers, integrations or product claims. All you may say about the product is: ${ctx.product}`;
 
   const contents: Content[] = [{ role: "user", parts: [{ text: trigger }] }];
   const tools = TOOLS.filter((t) => toolNames.includes(t.name));
@@ -540,6 +543,15 @@ function statusLabel(t: Row): string {
   return t.follow_up_sent_at ? "Follow-up sent, waiting" : "Waiting for a reply";
 }
 
+/** One line under the status: the time that matters right now. */
+function statusDetail(t: Row): string | null {
+  const s = t.state as State;
+  if (t.needs_human) return t.human_reason ?? null;
+  if (s.meeting_status === "confirmed" && t.meeting?.when) return t.meeting.when;
+  if (s.meeting_status === "pending_confirmation" && s.times_proposed.length) return `Proposed: ${s.times_proposed.join(" · ")}`;
+  return null;
+}
+
 export async function schedulingSnapshot() {
   const [threads, events, notifications, calendar] = await Promise.all([
     sql(`SELECT * FROM threads`),
@@ -551,8 +563,13 @@ export async function schedulingSnapshot() {
     threads: threads.map((t): Row => ({
       ...t,
       status_label: statusLabel(t),
+      status_detail: statusDetail(t),
       silent_hours: t.awaiting_reply && t.last_outbound_at ? Math.floor((Date.now() - new Date(t.last_outbound_at).getTime()) / 3_600_000) : null,
-      events: events.filter((e) => e.thread_id === t.id).map((e): Row => ({ ...e, at: formatIst(new Date(e.created_at)) })),
+      // The checkpoints stay in thread_events for the agent and for audits; the dashboard shows only when the latest one happened.
+      updated_at: (() => {
+        const last = events.filter((e) => e.thread_id === t.id).at(-1);
+        return last ? formatIst(new Date(last.created_at)) : null;
+      })(),
     })),
     notifications: notifications.map((n): Row => ({ ...n, at: formatIst(new Date(n.created_at)) })),
     calendar,

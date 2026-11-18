@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { CalendarCard, NotificationsCard, ThreadPanel } from "./Scheduling";
+import { NotificationsCard, ThreadPanel } from "./Scheduling";
 import { card, field, ghostBtn, label, primaryBtn, type CalendarEvent, type Notice, type Rules, type Run, type Thread } from "./shared";
 
 type Contact = {
@@ -84,10 +84,20 @@ type Company = {
   thread: Thread | null;
 };
 
-type Settings = { icp: string; product: string; senderName: string; senderTitle: string };
+type Settings = { icp: string; product: string; companyName: string; senderName: string; senderTitle: string };
+
+/** What the funnel is doing for the current ICP (built from it in icp.ts). */
+type Profile = { summary: string; custom: boolean; leadWith: string; incumbent: string; questions: string[] };
+
+const DEFAULT_ICP: Pick<Settings, "icp" | "product" | "companyName"> = {
+  icp: "SaaS companies, typically Series A-C, that are either preparing for a compliance audit or are under pressure from enterprise customers to get certified.",
+  product: "Sprinto automates compliance certifications - SOC 2, ISO 27001, GDPR - for SaaS companies.",
+  companyName: "Sprinto",
+};
 
 type State = {
   settings: Settings;
+  profile: Profile;
   companies: Company[];
   editsLogged: number;
   feedback: Feedback;
@@ -243,9 +253,9 @@ export default function Dashboard() {
         <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-3 sm:px-8">
           <div className="group flex items-center gap-3">
             <span className="flex h-9 w-9 rotate-3 items-center justify-center rounded-lg bg-primary font-serif text-xl font-bold italic text-white transition duration-300 group-hover:rotate-12">
-              S
+              {(state.settings.companyName || "S").charAt(0).toUpperCase()}
             </span>
-            <span className="text-sm font-bold text-ink">Sprinto Outreach</span>
+            <span className="text-sm font-bold text-ink">{state.settings.companyName || "Sprinto"} Outreach</span>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             {state.apis.map((a) => (
@@ -318,7 +328,7 @@ export default function Dashboard() {
           </div>
         )}
 
-        <SettingsCard key={JSON.stringify(state.settings)} settings={state.settings} run={run} busy={busy} />
+        <SettingsCard key={JSON.stringify(state.settings)} settings={state.settings} profile={state.profile} run={run} busy={busy} />
 
         <section className="mt-8 grid gap-6 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]">
           <div className={`${card} self-start lg:sticky lg:top-24`}>
@@ -379,83 +389,14 @@ export default function Dashboard() {
           </div>
 
           {selected ? (
-            <Detail company={selected} run={run} busy={busy} config={config} rules={state.rules} />
+            <Detail company={selected} run={run} busy={busy} config={config} rules={state.rules} profile={state.profile} />
           ) : (
             <div className={`${card} flex items-center justify-center text-sm text-ink/60`}>Select a company to see its POC and draft.</div>
           )}
         </section>
 
-        <CalendarCard events={state.calendar} rules={state.rules} run={run} busy={busy} google={config.google.email} />
-
-        <FeedbackCard feedback={state.feedback} />
-
-        <p className="mt-10 text-center text-[11px] font-bold uppercase tracking-widest text-ink/40">
-          {state.editsLogged} human edits logged · evals come next
-        </p>
       </main>
     </div>
-  );
-}
-
-function FeedbackCard({ feedback }: { feedback: Feedback }) {
-  return (
-    <section className={`${card} mt-8`}>
-      <div className="grid gap-8 lg:grid-cols-[minmax(0,4fr)_minmax(0,8fr)]">
-        <div>
-          <h2 className="font-serif text-4xl tracking-tight">
-            Feedback <span className="italic text-primary">loop</span>
-          </h2>
-          <p className="mt-3 text-sm leading-relaxed text-ink/70">
-            Every edit you save is compared with the system&apos;s own draft. What changed in the subject, hook, angle and call to action is stored, and applied to
-            the next draft for a similar prospect.
-          </p>
-          <dl className="mt-5 grid grid-cols-3 gap-3">
-            <div>
-              <dt className={label}>Lessons</dt>
-              <dd className="font-serif text-4xl text-ink">{feedback.lessons}</dd>
-            </div>
-            <div>
-              <dt className={label}>Avg. rewrite</dt>
-              <dd className="font-serif text-4xl text-ink">{feedback.averageDelta === null ? "–" : `${feedback.averageDelta}%`}</dd>
-            </div>
-            <div>
-              <dt className={label}>Sent as drafted</dt>
-              <dd className="font-serif text-4xl text-ink">{feedback.sentUntouched}</dd>
-            </div>
-          </dl>
-          <p className="mt-3 text-xs text-ink/60">
-            {feedback.firstFiveDelta !== null && feedback.lastFiveDelta !== null
-              ? `Rewrite needed: ${feedback.firstFiveDelta}% on the first five edited drafts, ${feedback.lastFiveDelta}% on the latest five.`
-              : "Avg. rewrite is the share of the email body you changed. The trend appears after ten edited drafts."}
-          </p>
-        </div>
-        <div>
-          <p className={label}>Latest lessons learned</p>
-          {feedback.recent.length === 0 ? (
-            <p className="mt-3 rounded-3xl bg-blush px-5 py-6 text-sm text-ink/70">Nothing learned yet. Edit a draft and save it to teach the system.</p>
-          ) : (
-            <ul className="mt-3 space-y-2">
-              {feedback.recent.map((l) => (
-                <li key={l.id} className="rounded-2xl border border-ink/5 px-4 py-3 text-sm">
-                  <p className="text-xs font-semibold text-ink/60">
-                    {l.persona} · {l.stage} · {l.framework} · {l.delta}% rewritten{l.sent && " · sent"}
-                  </p>
-                  <ul className="mt-1.5 space-y-1 text-ink">
-                    {l.rules.map((r, i) => (
-                      <li key={i} className="flex gap-2">
-                        <span className="text-primary">✦</span>
-                        {r}
-                      </li>
-                    ))}
-                    {l.rules.length === 0 && <li className="text-ink/50">No general lesson (a one-off correction).</li>}
-                  </ul>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      </div>
-    </section>
   );
 }
 
@@ -492,8 +433,10 @@ function Tag({ children, dark }: { children: React.ReactNode; dark?: boolean }) 
   );
 }
 
-function SettingsCard({ settings, run, busy }: { settings: Settings; run: Run; busy: string | null }) {
+function SettingsCard({ settings, profile, run, busy }: { settings: Settings; profile: Profile; run: Run; busy: string | null }) {
   const [form, setForm] = useState(settings);
+  const icpChanged = (["icp", "product", "companyName"] as const).some((k) => form[k].trim() !== settings[k].trim());
+  const isDefault = (["icp", "product", "companyName"] as const).every((k) => form[k].trim() === DEFAULT_ICP[k]);
   const [count, setCount] = useState(5);
   const [websites, setWebsites] = useState("");
   const dirty = JSON.stringify(form) !== JSON.stringify(settings);
@@ -509,14 +452,43 @@ function SettingsCard({ settings, run, busy }: { settings: Settings; run: Run; b
           <h2 className="font-serif text-5xl tracking-tight">
             The <span className="italic">ideal customer</span>
           </h2>
+          <p className="mt-3 max-w-xl text-sm leading-relaxed text-white/60">
+            Describe who you sell to and what you sell. Every step (search, website research, scoring, the contact to find and the email) follows it.
+          </p>
           <label className="mt-6 block">
             <span className={darkLabel}>ICP definition</span>
-            <textarea rows={3} value={form.icp} onChange={set("icp")} className={`${dark} mt-2`} />
+            <textarea rows={3} value={form.icp} onChange={set("icp")} placeholder="e.g. Seed to Series B fintech startups in India that are hiring their first sales team" className={`${dark} mt-2`} />
           </label>
-          <label className="mt-4 block">
-            <span className={darkLabel}>What we sell</span>
-            <textarea rows={2} value={form.product} onChange={set("product")} className={`${dark} mt-2`} />
-          </label>
+          <div className="mt-4 grid gap-4 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+            <label className="block">
+              <span className={darkLabel}>Your company</span>
+              <input value={form.companyName} onChange={set("companyName")} placeholder="Company name" className={`${dark} mt-2`} />
+            </label>
+            <label className="block">
+              <span className={darkLabel}>What we sell</span>
+              <textarea rows={2} value={form.product} onChange={set("product")} className={`${dark} mt-2`} />
+            </label>
+          </div>
+          <div className="mt-4 rounded-2xl bg-white/5 px-4 py-3 text-sm text-white/70">
+            {icpChanged ? (
+              <>Save to set the funnel up for this ICP (about 20 seconds). Companies found for other ICPs are kept but hidden; saving that ICP again brings them back.</>
+            ) : (
+              <>
+                <span className="font-semibold text-white">Targeting:</span> {profile.summary}.{" "}
+                <span className="font-semibold text-white">Qualifies on:</span> {profile.questions.join("; ")}.
+              </>
+            )}
+          </div>
+          {!isDefault && (
+            <button
+              type="button"
+              disabled={busy !== null}
+              onClick={() => setForm({ ...form, ...DEFAULT_ICP })}
+              className="mt-3 text-xs font-bold uppercase tracking-wider text-white/50 hover:text-white"
+            >
+              Reset to the default ICP
+            </button>
+          )}
         </div>
         <div className="flex flex-col">
           <span className={darkLabel}>Emails are signed by</span>
@@ -529,7 +501,7 @@ function SettingsCard({ settings, run, busy }: { settings: Settings; run: Run; b
             onClick={() => run("saveSettings", { settings: form })}
             className="mt-3 self-start rounded-[30px] border-2 border-white/20 px-5 py-2.5 text-xs font-bold uppercase tracking-wider transition hover:border-white disabled:opacity-40"
           >
-            {busy === "saveSettings" ? "Saving…" : dirty ? "Save changes" : "Saved"}
+            {busy === "saveSettings" ? (icpChanged ? "Setting up the ICP…" : "Saving…") : dirty ? (icpChanged ? "Save and set up ICP" : "Save changes") : "Saved"}
           </button>
 
           <div className="mt-auto pt-8">
@@ -574,13 +546,13 @@ function SettingsCard({ settings, run, busy }: { settings: Settings; run: Run; b
   );
 }
 
-function Detail({ company: c, run, busy, config, rules }: { company: Company; run: Run; busy: string | null; config: State["config"]; rules: Rules }) {
+function Detail({ company: c, run, busy, config, rules, profile }: { company: Company; run: Run; busy: string | null; config: State["config"]; rules: Rules; profile: Profile }) {
   const facts: [string, string | null][] = [
     ["Funding", c.last_funding && c.last_funding !== "unknown" ? c.last_funding : c.funding_stage],
     ["HQ", c.hq],
     ["Employees", c.employees],
     ["Sells to", c.target_markets],
-    ["Certifications held", c.certifications_held],
+    [profile.incumbent, c.certifications_held],
     ...(c.profile
       ? ([
           ["Industry (Hunter.io)", [c.profile.industry, c.profile.company_type].filter(Boolean).join(" · ") || null],
@@ -628,7 +600,7 @@ function Detail({ company: c, run, busy, config, rules }: { company: Company; ru
         <p className={label}>
           ICP fit · {c.fit_score ?? "not scored"}
           {c.fit_score !== null && "/100"}
-          {c.recommended_framework && ` · lead with ${c.recommended_framework}`}
+          {c.recommended_framework && ` · ${profile.leadWith.toLowerCase()}: ${c.recommended_framework}`}
         </p>
         <p className="mt-2 text-sm leading-relaxed text-ink">{c.fit_reason ?? "No score yet."}</p>
         {!c.info_sufficient && (

@@ -22,18 +22,19 @@ export type ThreadState = {
   crm_logged: boolean;
 };
 
-export type ThreadEvent = { id: number; kind: "email_out" | "email_in" | "tool" | "branch" | "human"; summary: string; body: string | null; state: ThreadState; at: string };
-
 export type Thread = {
   id: number;
   state: ThreadState;
   status_label: string;
   needs_human: boolean;
   human_reason: string | null;
+  /** The time that matters right now: the meeting time, or the proposed slots. */
+  status_detail: string | null;
   meeting: { when: string; link: string } | null;
   silent_hours: number | null;
   follow_up_sent_at: string | null;
-  events: ThreadEvent[];
+  /** When the latest checkpoint happened. */
+  updated_at: string | null;
 };
 
 export type Notice = { id: number; message: string; at: string; company_id: number | null };

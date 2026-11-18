@@ -17,7 +17,7 @@ export type PageType =
   | "product" | "customers" | "press" | "team" | "funding_search"
   // Used when researching a person: a page their email was found on, and a web search for them.
   | "contact_source" | "person_search"
-  // A web search for recent news that shows compliance pressure.
+  // A web search for recent news that shows buying intent for the ICP.
   | "news_search";
 
 /** Page types that are found by following the site's own links. */
@@ -125,19 +125,27 @@ const NOISE = "script, style, noscript, svg, iframe, template, nav, footer, asid
 const NOISE_NAMES = /cookie|consent|banner|popup|modal|newsletter|subscribe|breadcrumb|sidebar/i;
 const BLOCKS = "p, div, section, article, li, h1, h2, h3, h4, h5, h6, tr, br, dt, dd, blockquote";
 
-const HINT_PATTERNS: [string, RegExp][] = [
-  ["mentions SOC 2", /\bsoc\s?(2|ii)\b/i],
-  ["mentions ISO 27001", /\biso[\s/-]?(iec\s)?27001\b/i],
-  ["mentions GDPR", /\bgdpr\b/i],
-  ["mentions HIPAA", /\bhipaa\b/i],
-  ["has a trust or security centre", /trust (center|centre|portal)|security (center|centre|portal)/i],
-  ["says a certification is in progress", /(soc\s?2|iso\s?27001|certification|audit)[^.]{0,60}(in progress|underway|working towards|coming soon|pursuing)/i],
+/** A keyword finding: its label and a case-insensitive regular expression. */
+export type Hint = [label: string, pattern: string];
+
+// Findings that matter for any ICP. The ICP profile adds its own (icp.ts).
+const BASE_HINTS: [string, RegExp][] = [
   ["has an enterprise offering", /\benterprise (plan|tier|pricing|customers|grade|ready|sales)\b|contact sales/i],
-  ["hiring for a security or compliance role", /\b(security|compliance|grc|risk|infosec|privacy)\s+(engineer|manager|lead|analyst|officer|director|specialist|counsel)\b|\bciso\b/i],
   ["mentions a funding round", /\b(series\s[a-e]|seed round|pre-seed|raised \$[\d.]+\s?(m|million|b|billion))\b/i],
 ];
 
-function parse(html: string, pageUrl: string, pageType: PageType, status: number, maxChars: number): ScrapedPage {
+function compileHints(extra: Hint[]): [string, RegExp][] {
+  const compiled = extra.flatMap(([label, pattern]): [string, RegExp][] => {
+    try {
+      return [[label, new RegExp(pattern, "i")]];
+    } catch {
+      return [];
+    }
+  });
+  return [...compiled, ...BASE_HINTS];
+}
+
+function parse(html: string, pageUrl: string, pageType: PageType, status: number, maxChars: number, extraHints: Hint[] = []): ScrapedPage {
   const $ = cheerio.load(html);
   const base = new URL(pageUrl);
 
@@ -164,7 +172,7 @@ function parse(html: string, pageUrl: string, pageType: PageType, status: number
     }
   });
   const fullText = $("body").text().replace(/\s+/g, " ");
-  const hints = HINT_PATTERNS.filter(([, re]) => re.test(fullText)).map(([name]) => name);
+  const hints = compileHints(extraHints).filter(([, re]) => re.test(fullText)).map(([name]) => name);
 
   // Heuristic region selection: drop navigation, footers and other chrome,
   // then keep the largest text block.
@@ -222,10 +230,10 @@ export async function store(companyId: number, purpose: "qualify" | "contacts", 
 // ---------------------------------------------------------------- one page
 
 /** Runs Request -> Parse -> Extract -> Clean on a single URL. Storing is done by the caller. */
-export async function scrapePage(url: string, pageType: PageType, maxChars = MAX_TEXT_CHARS): Promise<{ page: ScrapedPage } | { error: string; status: number }> {
+export async function scrapePage(url: string, pageType: PageType, maxChars = MAX_TEXT_CHARS, extraHints: Hint[] = []): Promise<{ page: ScrapedPage } | { error: string; status: number }> {
   const fetched = await request(url);
   if (!fetched.ok) return { error: fetched.error, status: fetched.status };
-  return { page: parse(fetched.html, fetched.url, pageType, fetched.status, maxChars) };
+  return { page: parse(fetched.html, fetched.url, pageType, fetched.status, maxChars, extraHints) };
 }
 
 // ------------------------------------------------------ finding a named page

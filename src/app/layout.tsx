@@ -11,7 +11,7 @@ const instrumentSerif = Instrument_Serif({
 });
 
 export const metadata: Metadata = {
-  title: "Sprinto Outreach",
+  title: "Outreach Funnel",
   description: "ICP-driven prospecting funnel: shortlist, find the POC, draft, review and send.",
 };
 

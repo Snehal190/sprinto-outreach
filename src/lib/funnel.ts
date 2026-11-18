@@ -5,7 +5,10 @@ import { deliver, resendLive, testRecipients } from "./mailer";
 import { googleAccount, googleConfigured } from "./google";
 import { forgetApiTest, requireApis, testAllApis } from "./health";
 import { schedulingSnapshot, startThread } from "./scheduler";
-import { describeOpen, findContactsOnWebsite, qualifyFromWebsite, rankTitle, researchPerson, type Person, type PersonResearch } from "./research";
+import { describeOpen, findContactsOnWebsite, qualifyFromWebsite, researchPerson, type Person, type PersonResearch } from "./research";
+import { DEFAULT_SETTINGS, getProfile, getSettings, icpKey, rankTitle, type IcpProfile, type Settings } from "./icp";
+
+export { getSettings, type Settings };
 
 // The basic funnel: ICP -> discover -> score/shortlist -> POC + pain points
 // -> draft -> human edit -> send. Companies without enough information are
@@ -14,22 +17,18 @@ import { describeOpen, findContactsOnWebsite, qualifyFromWebsite, rankTitle, res
 
 export const SHORTLIST_THRESHOLD = 70;
 
-export type Settings = { icp: string; product: string; senderName: string; senderTitle: string };
-
-const DEFAULT_SETTINGS: Settings = {
-  icp: "SaaS companies, typically Series A-C, that are either preparing for a compliance audit or are under pressure from enterprise customers to get certified.",
-  product: "Sprinto automates compliance certifications - SOC 2, ISO 27001, GDPR - for SaaS companies.",
-  senderName: "",
-  senderTitle: "",
-};
-
-export async function getSettings(): Promise<Settings> {
-  const rows = await sql(`SELECT value FROM settings WHERE key = 'funnel'`);
-  return { ...DEFAULT_SETTINGS, ...(rows[0]?.value ?? {}) };
-}
-
+/**
+ * Saves the settings. A new ICP first gets its profile (one model call), so a
+ * failure leaves the old settings in place. Companies found for another ICP
+ * stay in the database but drop out of view; saving that ICP again brings
+ * them back.
+ */
 export async function saveSettings(patch: Partial<Settings>): Promise<Settings> {
   const next = { ...(await getSettings()), ...patch };
+  for (const k of ["icp", "product", "companyName"] as const) {
+    next[k] = String(next[k] ?? "").trim() || DEFAULT_SETTINGS[k];
+  }
+  await getProfile(next);
   await sql(
     `INSERT INTO settings (key, value) VALUES ('funnel', $1::jsonb)
      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
@@ -39,16 +38,19 @@ export async function saveSettings(patch: Partial<Settings>): Promise<Settings> 
 }
 
 export async function getState() {
-  const [settings, companies, contacts, drafts, edits, lessons, feedback, scheduling] = await Promise.all([
-    getSettings(),
-    sql(`SELECT * FROM companies ORDER BY fit_score DESC NULLS LAST, id DESC`),
+  const settings = await getSettings();
+  const key = icpKey(settings);
+  const [profile, companies, contacts, drafts, edits, lessons, feedback, scheduling] = await Promise.all([
+    getProfile(settings),
+    sql(`SELECT * FROM companies WHERE icp_key = $1 ORDER BY fit_score DESC NULLS LAST, id DESC`, [key]),
     sql(`SELECT * FROM contacts`),
     sql(`SELECT * FROM drafts`),
-    sql(`SELECT count(*)::int AS n FROM draft_edits`),
+    sql(`SELECT count(*)::int AS n FROM draft_edits e JOIN drafts d ON d.id = e.draft_id JOIN companies c ON c.id = d.company_id WHERE c.icp_key = $1`, [key]),
     sql(`SELECT * FROM lessons WHERE draft_id IS NOT NULL`),
-    feedbackStats(),
+    feedbackStats(key),
     schedulingSnapshot(),
   ]);
+  const visible = new Set(companies.map((c) => c.id));
   const google = { configured: googleConfigured(), email: await googleAccount() };
   const withLesson = (d: Row | undefined) => (d ? { ...d, lesson: lessons.find((l) => l.draft_id === d.id) ?? null } : null);
   return {
@@ -59,7 +61,8 @@ export async function getState() {
       draft: withLesson(drafts.find((d) => d.company_id === c.id)),
       thread: scheduling.threads.find((t) => t.company_id === c.id) ?? null,
     })),
-    notifications: scheduling.notifications,
+    profile: { summary: profile.summary, custom: profile.custom, leadWith: profile.leadWith.label, incumbent: profile.incumbent.label, questions: profile.questions.map((q) => q.label) },
+    notifications: scheduling.notifications.filter((n) => n.company_id === null || visible.has(n.company_id)),
     calendar: scheduling.calendar,
     rules: scheduling.rules,
     editsLogged: edits[0]?.n ?? 0,
@@ -91,7 +94,7 @@ async function getCompany(id: number): Promise<Row> {
   return rows[0];
 }
 
-function companyFacts(c: Row): string {
+function companyFacts(c: Row, profile: IcpProfile): string {
   return [
     `Name: ${c.name}`,
     `Website: ${c.domain}`,
@@ -100,7 +103,7 @@ function companyFacts(c: Row): string {
     `HQ: ${c.hq ?? "unknown"}`,
     `Employees: ${c.employees ?? "unknown"}`,
     `Target markets / customers: ${c.target_markets ?? "unknown"}`,
-    `Certifications already held: ${c.certifications_held ?? "unknown"}`,
+    `${profile.incumbent.label}: ${c.certifications_held ?? "unknown"}`,
     `Signals: ${(c.signals ?? []).join("; ") || "none found"}`,
   ].join("\n");
 }
@@ -129,29 +132,26 @@ type Score = {
   missing_info?: string;
 };
 
-async function scoreCompanies(settings: Settings, found: Found[]): Promise<Score[]> {
+async function scoreCompanies(settings: Settings, profile: IcpProfile, found: Found[]): Promise<Score[]> {
   const { data } = await generateJson<Score[] | Score>(
     `Score each company against this ICP for the seller described.
 
-Seller: ${settings.product}
+Seller: ${settings.companyName}. ${settings.product}
 ICP: ${settings.icp}
 
 Scoring rubric (0-100):
-- Must be a SaaS company. If it is not, score below 20.
-- Funding stage Series A-C is the sweet spot. Seed or Series D+ lowers the score.
-- Intent matters most: evidence they are preparing for a compliance audit, or are under enterprise
-  customer pressure to get certified. Strong evidence = high score. No evidence = at most 55.
-- Already holding the relevant certifications lowers the score sharply.
+${profile.rubric.map((r) => `- ${r}`).join("\n")}
 - Judge only from the facts given. Where facts are "unknown", do not assume them.
 
 Set info_sufficient to false when the facts are too thin to judge ICP fit confidently, and say in
 missing_info exactly what is missing (these companies will be sent to a scraper for more data).
-recommended_framework is the one certification to lead with: "SOC 2" (selling to US enterprise),
-"ISO 27001" (EU / international enterprise) or "GDPR" (processing EU personal data).
+recommended_framework is the ${profile.leadWith.label.toLowerCase()}: ${profile.leadWith.guide}.
 fit_reason is 1-2 plain sentences citing the specific facts behind the score.
 
 Companies:
 ${JSON.stringify(found, null, 1)}
+
+"certifications_held" in the facts means: ${profile.incumbent.label.toLowerCase()}.
 
 Return a JSON array with one item per company:
 {"domain": string, "fit_score": number, "fit_reason": string, "recommended_framework": string,
@@ -163,31 +163,31 @@ Return a JSON array with one item per company:
 
 export async function discoverCompanies(count: number) {
   const settings = await getSettings();
-  const known = (await sql(`SELECT domain FROM companies`)).map((r) => r.domain);
+  const profile = await getProfile(settings);
+  const key = icpKey(settings);
+  const known = (await sql(`SELECT domain FROM companies WHERE icp_key = $1`, [key])).map((r) => r.domain);
 
   // Step 1: find candidates with live Google Search.
   const search = await generate(
-    `You are a B2B sales researcher for this company:
+    `You are a B2B sales researcher for ${settings.companyName}:
 ${settings.product}
 
 Ideal customer profile (ICP):
 ${settings.icp}
 
 Use Google Search to find ${count} real companies that match this ICP right now. Prioritise companies showing
-intent signals such as: a recent Series A-C round, moving upmarket to enterprise customers, hiring for
-security/compliance/GRC roles, selling into regulated industries (fintech, healthtech, HR, legal), handling
-sensitive customer data, expanding into the US or EU, or publicly stating a certification is "in progress".
-Prefer companies that do NOT already hold SOC 2 / ISO 27001.
+intent signals such as: ${profile.discovery.signals}.
+${profile.discovery.avoid}
 ${known.length ? `Do not return any of these, they are already in the list: ${known.join(", ")}.` : ""}
 
 Only state facts you found. If you could not find a fact, write "unknown" - never guess.
 
 Return ONLY a JSON array, no prose, where each item is:
 {"name": string, "domain": "example.com", "description": one sentence on what the product does,
- "funding_stage": "Seed" | "Series A" | "Series B" | "Series C" | "Series D+" | "unknown",
+ "funding_stage": e.g. "Seed", "Series A", "Series B", "Series C", "Series D+", "Bootstrapped", "Public" or "unknown",
  "last_funding": e.g. "$20M Series A, March 2026" or "unknown", "hq": "City, Country",
  "employees": e.g. "51-200" or "unknown", "target_markets": who they sell to and in which regions,
- "certifications_held": e.g. "none found" or "SOC 2 Type II",
+ "certifications_held": ${profile.incumbent.label.toLowerCase()}, e.g. ${profile.incumbent.example},
  "signals": [short factual intent signals, each with its date or source where known]}`,
     { search: true, temperature: 0.3, fast: true },
   );
@@ -198,7 +198,7 @@ Return ONLY a JSON array, no prose, where each item is:
   if (found.length === 0) return { added: 0 };
 
   // Step 2: score each candidate against the ICP.
-  const scores = await scoreCompanies(settings, found);
+  const scores = await scoreCompanies(settings, profile, found);
 
   let added = 0;
   for (const f of found) {
@@ -207,9 +207,9 @@ Return ONLY a JSON array, no prose, where each item is:
     const rows = await sql(
       `INSERT INTO companies (name, domain, description, funding_stage, last_funding, hq, employees,
          target_markets, certifications_held, signals, sources, fit_score, fit_reason,
-         recommended_framework, info_sufficient, missing_info, status, scrape_status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13,$14,$15,$16,$17,$18)
-       ON CONFLICT (domain) DO NOTHING RETURNING id`,
+         recommended_framework, info_sufficient, missing_info, status, scrape_status, icp_key)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12,$13,$14,$15,$16,$17,$18,$19)
+       ON CONFLICT (domain, icp_key) DO NOTHING RETURNING id`,
       [
         f.name, f.domain, f.description ?? null, f.funding_stage ?? null, f.last_funding ?? null,
         f.hq ?? null, f.employees ?? null, f.target_markets ?? null, f.certifications_held ?? null,
@@ -219,6 +219,7 @@ Return ONLY a JSON array, no prose, where each item is:
         score !== null && score >= SHORTLIST_THRESHOLD ? "shortlisted" : "candidate",
         // Not enough information to judge fit: queue the company for the scraper.
         s?.info_sufficient ? "none" : "pending",
+        key,
       ],
     );
     added += rows.length;
@@ -239,14 +240,15 @@ export async function deleteCompany(id: number) {
 
 /** The Growth Lead's own list of company websites. Each one is queued for the scraper. */
 export async function addCompanies(websites: string[]) {
+  const key = icpKey(await getSettings());
   let added = 0;
   for (const domain of [...new Set(websites.map(cleanDomain))]) {
     if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(domain)) continue;
     const rows = await sql(
-      `INSERT INTO companies (name, domain, info_sufficient, missing_info, scrape_status)
-       VALUES ($1, $1, FALSE, 'Not researched yet', 'pending')
-       ON CONFLICT (domain) DO NOTHING RETURNING id`,
-      [domain],
+      `INSERT INTO companies (name, domain, info_sufficient, missing_info, scrape_status, icp_key)
+       VALUES ($1, $1, FALSE, 'Not researched yet', 'pending', $2)
+       ON CONFLICT (domain, icp_key) DO NOTHING RETURNING id`,
+      [domain, key],
     );
     added += rows.length;
   }
@@ -255,7 +257,7 @@ export async function addCompanies(websites: string[]) {
 
 const EXIT_TEXT: Record<string, string> = {
   decided: "Every question was answered.",
-  not_saas: "Stopped early: this is not a SaaS company.",
+  not_fit: "Stopped early: it fails a must-have question.",
   sources_exhausted: "Stopped: every relevant page was tried.",
   page_limit: "Stopped: page limit reached.",
   request_limit: "Stopped: request limit reached.",
@@ -271,8 +273,9 @@ const EXIT_TEXT: Record<string, string> = {
 export async function scrapeCompany(id: number) {
   const company = await getCompany(id);
   const settings = await getSettings();
+  const profile = await getProfile(settings);
   try {
-    const result = await qualifyFromWebsite(company, settings);
+    const result = await qualifyFromWebsite(company, settings, profile);
     const f = result.facts;
     const keep = (next: string | undefined, current: string | null) =>
       next && !/^(unknown|n\/a)$/i.test(next.trim()) ? next : current;
@@ -296,17 +299,17 @@ export async function scrapeCompany(id: number) {
       pagesRead: result.pagesRead,
       requests: result.requests,
       durationMs: result.durationMs,
-      isSaas: f?.is_saas ?? "unknown",
-      compliancePressure: f?.compliance_pressure ?? "no_evidence",
+      answers: Object.fromEntries(profile.questions.map((q) => [q.label, f?.answers?.[q.id] ?? "unknown"])),
     };
     const missing = result.decided ? null : `${EXIT_TEXT[result.exitReason]} Still unknown: ${describeOpen(result.open)}.`;
 
     // The system still has to answer, even on a forced exit: score with what it has.
     let score: Score | undefined;
-    if (result.exitReason === "not_saas") {
-      score = { domain: company.domain, fit_score: 10, fit_reason: `Not a SaaS company: ${merged.description ?? "see website"}`, recommended_framework: "", info_sufficient: true };
+    if (result.exitReason === "not_fit") {
+      score = { domain: company.domain, fit_score: 10, fit_reason: `Fails a must-have (${result.failed ?? "fit question"}): ${merged.description ?? "see website"}`, recommended_framework: "", info_sufficient: true };
     } else if (f) {
-      score = (await scoreCompanies(settings, [{ ...merged, is_saas: f.is_saas, compliance_pressure: f.compliance_pressure } as Found]))[0];
+      const answers = Object.fromEntries(profile.questions.map((q) => [q.id, f.answers?.[q.id] ?? "unknown"]));
+      score = (await scoreCompanies(settings, profile, [{ ...merged, ...answers } as Found]))[0];
     }
     const fit = score ? Math.max(0, Math.min(100, Math.round(Number(score.fit_score) || 0))) : company.fit_score;
 
@@ -382,35 +385,35 @@ async function hunterDomainSearch(domain: string, filters: Record<string, string
  * profile. Each Hunter call costs a credit, so:
  *  - the answer is cached per domain and reused on every later lookup;
  *  - it first asks only for senior people in the departments that own
- *    compliance, and widens to everyone only when that returns nobody.
+ *    the ICP's buyer, and widens to everyone only when that returns nobody.
  */
-async function hunterSearch(domain: string): Promise<{ people: Person[]; profile: HunterProfile | null; cached: boolean }> {
+async function hunterSearch(domain: string, profile: IcpProfile): Promise<{ people: Person[]; profile: HunterProfile | null; cached: boolean }> {
   const hit = (await sql(`SELECT people, profile FROM hunter_cache WHERE domain = $1`, [domain]))[0];
-  if (hit) return { people: hit.people, profile: hit.profile, cached: true };
+  // The cache is shared by every ICP; the ranking depends on the ICP, so it is done on the way out.
+  const ranked = (people: Person[]) => [...people].sort((a, b) => rankTitle(a.title, profile) - rankTitle(b.title, profile) || (b.confidence ?? 0) - (a.confidence ?? 0));
+  if (hit) return { people: ranked(hit.people), profile: hit.profile, cached: true };
 
   // About to spend a credit: make sure the key works and credits are left first.
   await requireApis(["hunter"]);
-  let result = await hunterDomainSearch(domain, { seniority: "senior,executive", department: "it,executive,management" });
+  const departments: Record<string, string> = profile.hunterDepartments.length ? { department: profile.hunterDepartments.join(",") } : {};
+  let result = await hunterDomainSearch(domain, { seniority: "senior,executive", ...departments });
   if (result.people.length === 0) result = await hunterDomainSearch(domain, {});
-  result.people.sort((a, b) => rankTitle(a.title) - rankTitle(b.title) || (b.confidence ?? 0) - (a.confidence ?? 0));
   await sql(
     `INSERT INTO hunter_cache (domain, people, profile) VALUES ($1, $2::jsonb, $3::jsonb)
      ON CONFLICT (domain) DO UPDATE SET people = EXCLUDED.people, profile = EXCLUDED.profile, fetched_at = now()`,
     [domain, JSON.stringify(result.people), JSON.stringify(result.profile)],
   );
-  return { ...result, cached: false };
+  return { ...result, people: ranked(result.people), cached: false };
 }
 
-// Compliance tools that show the company already has a vendor.
-const COMPETITORS = /vanta|drata|secureframe|thoropass|scrut|scytale|hyperproof|anecdotes/i;
-
 /** Merges Hunter's company profile into the company record, filling gaps only. */
-async function applyProfile(company: Row, profile: HunterProfile | null) {
+async function applyProfile(company: Row, profile: HunterProfile | null, icp: IcpProfile) {
   if (!profile) return;
   const blank = (v: unknown) => !v || /^unknown$/i.test(String(v));
   const signals: string[] = [...(company.signals ?? [])];
-  const rival = profile.technologies.find((t) => COMPETITORS.test(t));
-  if (rival && !signals.some((x) => x.includes(rival))) signals.push(`Already uses a compliance tool: ${rival} (Hunter.io)`);
+  // Tools that show the company already has a vendor for what the seller sells.
+  const rival = profile.technologies.find((t) => icp.competitors.some((c) => t.toLowerCase().includes(c.toLowerCase())));
+  if (rival && !signals.some((x) => x.includes(rival))) signals.push(`Already uses a competing tool: ${rival} (Hunter.io)`);
   await sql(`UPDATE companies SET profile = $1::jsonb, employees = $2, hq = $3, signals = $4::jsonb WHERE id = $5`, [
     JSON.stringify(profile),
     blank(company.employees) && profile.headcount ? profile.headcount : company.employees,
@@ -436,20 +439,20 @@ function personNotes(research: PersonResearch | null | undefined): string {
   return verified.map((f) => `- ${f.text}`).join("\n");
 }
 
-async function painPoints(company: Row, title: string, settings: Settings, research: PersonResearch | null): Promise<string[]> {
+async function painPoints(company: Row, title: string, settings: Settings, profile: IcpProfile, research: PersonResearch | null): Promise<string[]> {
   const { data } = await generateJson<{ pain_points: string[] }>(
-    `Seller: ${settings.product}
+    `Seller: ${settings.companyName}. ${settings.product}
 
 Prospect company:
-${companyFacts(company)}
+${companyFacts(company, profile)}
 
-The person we will email holds this role: ${title || "senior leader responsible for security/compliance"}.
+The person we will email holds this role: ${title || profile.roles[0]?.persona || "senior leader"}.
 What we know about this person:
 ${personNotes(research)}
 
-Give exactly two pain points this specific person is likely feeling right now about compliance
-certification (${company.recommended_framework ?? "SOC 2 / ISO 27001 / GDPR"}). Each must be tied to
-their role AND to a concrete fact about this company above - not generic compliance pain. Where what we
+Give exactly two pain points this specific person is likely feeling right now about ${profile.painTopic}
+(${company.recommended_framework || profile.leadWith.options.join(" / ") || "what the seller offers"}). Each must be tied to
+their role AND to a concrete fact about this company above - not generic pain. Where what we
 know about the person makes a pain more specific (their remit, their background), use it.
 Each is one sentence, under 30 words.
 
@@ -462,19 +465,20 @@ Return JSON: {"pain_points": [string, string]}`,
 export async function findPoc(companyId: number) {
   const company = await getCompany(companyId);
   const settings = await getSettings();
+  const profile = await getProfile(settings);
 
   let person: Person | null = null;
   let source = "mock";
   if (process.env.HUNTER_API_KEY) {
-    const hunter = await hunterSearch(company.domain);
-    await applyProfile(company, hunter.profile);
+    const hunter = await hunterSearch(company.domain, profile);
+    await applyProfile(company, hunter.profile, profile);
     person = hunter.people[0] ?? null;
     source = "hunter";
   }
   if (!person) {
     // Hunter.io has nobody for this company (or is not connected): look for a
     // named person on the company's own website with the scraper.
-    const scraped = await findContactsOnWebsite(company);
+    const scraped = await findContactsOnWebsite(company, profile);
     person = scraped.people[0] ?? null;
     source = "scraped";
     // A name without an email: ask Hunter for that specific person's address.
@@ -489,21 +493,21 @@ export async function findPoc(companyId: number) {
     person = { first_name: "Sample", last_name: "Contact", title: "CTO (placeholder)", email: `placeholder@${company.domain}`, confidence: null };
     source = "mock";
   }
-  await researchAndSave(company, settings, person, source);
+  await researchAndSave(company, settings, profile, person, source);
 }
 
 /** Researches the person (unless they are a placeholder), works out their pain points and saves the contact. */
-async function researchAndSave(company: Row, settings: Settings, person: Person, source: string) {
+async function researchAndSave(company: Row, settings: Settings, profile: IcpProfile, person: Person, source: string) {
   // A research failure must not lose the contact, so it degrades to "nothing found".
   let research: PersonResearch | null = null;
   if (source !== "mock") {
-    research = await researchPerson(company, person).catch((err) => {
+    research = await researchPerson(company, person, profile).catch((err) => {
       console.error("Person research failed:", err);
       return null;
     });
   }
 
-  const pains = await painPoints(company, person.title.replace(" (placeholder)", ""), settings, research);
+  const pains = await painPoints(company, person.title.replace(" (placeholder)", ""), settings, profile, research);
   await sql(
     `INSERT INTO contacts (company_id, first_name, last_name, title, email, confidence, source, pain_points, linkedin, research)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10::jsonb)
@@ -526,7 +530,8 @@ export async function researchPoc(companyId: number) {
   const earlier: string[] = (contact.research?.steps ?? [])
     .filter((s: Row) => s.source === "contact_source" && typeof s.url === "string" && s.url.startsWith("http"))
     .map((s: Row) => s.url);
-  await researchAndSave(company, await getSettings(), {
+  const settings = await getSettings();
+  await researchAndSave(company, settings, await getProfile(settings), {
     first_name: contact.first_name, last_name: contact.last_name, title: contact.title, email: contact.email,
     confidence: contact.confidence, linkedin: contact.linkedin, sourceUrls: known?.sourceUrls ?? earlier.slice(0, 2),
   }, contact.source);
@@ -548,28 +553,29 @@ export async function updateContact(id: number, patch: Row) {
 export async function draftEmail(companyId: number) {
   const company = await getCompany(companyId);
   const settings = await getSettings();
+  const profile = await getProfile(settings);
   const contact = (await sql(`SELECT * FROM contacts WHERE company_id = $1`, [companyId]))[0];
   if (!contact) throw new Error("Find the POC before drafting the email");
 
   // Feedback loop, retrieve + apply: lessons from past human edits for
   // prospects with a similar ICP profile go into the prompt.
-  const learned = await retrieveLessons(segmentOf(company, contact));
+  const learned = await retrieveLessons(segmentOf(company, contact, profile), profile.key);
   const { data } = await generateJson<{ subject: string; hook: string; cta: string; body: string }>(
     `Write a cold outreach email.
 
-Seller: ${settings.product}
-Sender: ${settings.senderName || "[Your name]"}${settings.senderTitle ? `, ${settings.senderTitle}` : ""} at Sprinto
+Seller: ${settings.companyName}. ${settings.product}
+Sender: ${settings.senderName || "[Your name]"}${settings.senderTitle ? `, ${settings.senderTitle}` : ""} at ${settings.companyName}
 
 Recipient: ${contact.first_name} ${contact.last_name}, ${String(contact.title).replace(" (placeholder)", "")} at ${company.name}
 
 About their company:
-${companyFacts(company)}
+${companyFacts(company, profile)}
 
 What we know about the recipient:
 ${personNotes(contact.research)}
 
 Why they fit: ${company.fit_reason ?? "matches the ICP"}
-Certification to lead with: ${company.recommended_framework ?? "SOC 2"}
+${profile.leadWith.label}: ${company.recommended_framework || profile.leadWith.options[0] || "the best fit"}
 
 Their two pain points:
 ${(contact.pain_points ?? []).map((p: string, i: number) => `${i + 1}. ${p}`).join("\n")}
@@ -581,8 +587,8 @@ Rules:
   "I hope this finds you well", "I came across", or by introducing the sender.
 - Weave in both pain points naturally, in their words, not as a list.
 - Write for this person's seniority and remit. You may reference one thing we know about them if it is
-  clearly relevant to compliance, but never say where it was found and never sound like you researched them.
-- One or two sentences on how Sprinto removes that pain. No feature lists, no buzzwords.
+  clearly relevant to ${profile.painTopic}, but never say where it was found and never sound like you researched them.
+- One or two sentences on how ${settings.companyName} removes that pain. No feature lists, no buzzwords.
 - End with one low-friction question as the call to action.
 - 90-130 words, plain text, short paragraphs, sounds like one human writing to another.
 - No exclamation marks, no emojis, no placeholders other than the sender name if it is unknown.

@@ -1,6 +1,6 @@
 import { sql, type Row } from "./db";
 import { generateJson } from "./gemini";
-import { rankTitle } from "./research";
+import { getProfile, personaOf, type IcpProfile } from "./icp";
 
 // The feedback loop. Goal: shrink the gap between the email the system drafts
 // and the email the human actually sends.
@@ -20,11 +20,9 @@ import { rankTitle } from "./research";
 /** The ICP profile a lesson belongs to. Lessons are retrieved by similarity on these three fields. */
 export type Segment = { persona: string; framework: string; stage: string };
 
-const PERSONAS = ["security or compliance leader", "engineering leader", "founder or executive", "engineer", "other role"];
-
-export function segmentOf(company: Row, contact: Row | undefined): Segment {
+export function segmentOf(company: Row, contact: Row | undefined, profile: IcpProfile): Segment {
   return {
-    persona: PERSONAS[rankTitle(String(contact?.title ?? ""))] ?? "other role",
+    persona: personaOf(String(contact?.title ?? ""), profile),
     framework: company.recommended_framework || "unknown",
     stage: company.funding_stage || "unknown",
   };
@@ -85,12 +83,13 @@ export async function captureLesson(draftId: number): Promise<{ learned: number 
     return { learned: 0 };
   }
 
-  const segment = segmentOf(company ?? {}, contact);
+  const profile = await getProfile();
+  const segment = segmentOf(company ?? {}, contact, profile);
   const { data } = await generateJson<Captured>(
     `A salesperson edited an AI-drafted cold email before sending it. Work out exactly what they changed, and what
 the drafting system should learn so that its next draft for a similar prospect needs fewer edits.
 
-Prospect profile: ${contact?.title ?? "unknown title"} (${segment.persona}) at a ${segment.stage} SaaS company; the email leads with ${segment.framework}.
+Prospect profile: ${contact?.title ?? "unknown title"} (${segment.persona}) at a ${segment.stage} company; the email leads with ${segment.framework}.
 
 ORIGINAL DRAFT (written by the system)
 Subject: ${draft.original_subject}
@@ -129,14 +128,14 @@ Return JSON: {"components": {"subject": {"changed": boolean, "before": string, "
   const rules = Array.isArray(data.rules) ? data.rules.slice(0, 4).map(String) : [];
 
   await sql(
-    `INSERT INTO lessons (draft_id, company_name, title, persona, framework, stage, components, rules, tone, feedback, delta_subject, delta_body)
-     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10,$11,$12)
+    `INSERT INTO lessons (draft_id, company_name, title, persona, framework, stage, components, rules, tone, feedback, delta_subject, delta_body, icp_key)
+     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10,$11,$12,$13)
      ON CONFLICT (draft_id) DO UPDATE SET components = EXCLUDED.components, rules = EXCLUDED.rules, tone = EXCLUDED.tone,
        feedback = EXCLUDED.feedback, delta_subject = EXCLUDED.delta_subject, delta_body = EXCLUDED.delta_body,
        title = EXCLUDED.title, persona = EXCLUDED.persona, framework = EXCLUDED.framework, stage = EXCLUDED.stage,
        updated_at = now()`,
     [draftId, company?.name ?? "", contact?.title ?? "", segment.persona, segment.framework, segment.stage,
-     JSON.stringify(data.components ?? {}), JSON.stringify(rules), data.tone ?? null, feedback, deltaSubject, deltaBody],
+     JSON.stringify(data.components ?? {}), JSON.stringify(rules), data.tone ?? null, feedback, deltaSubject, deltaBody, company?.icp_key ?? profile.key],
   );
   return { learned: rules.length };
 }
@@ -163,16 +162,17 @@ const MAX_LESSONS = 5;
 /**
  * The most relevant past lessons for a prospect. Relevance is how closely the
  * lesson's ICP profile matches (same kind of person matters most, then the
- * certification, then the funding stage), with lessons from emails that were
- * actually sent and newer lessons breaking ties.
+ * angle the email leads with, then the funding stage), with lessons from
+ * emails that were actually sent and newer lessons breaking ties. Only
+ * lessons learned under the same ICP are used.
  */
-export async function retrieveLessons(segment: Segment): Promise<{ applied: Applied[]; promptBlock: string }> {
-  const rows = await sql(`SELECT * FROM lessons WHERE jsonb_array_length(rules) > 0 ORDER BY updated_at DESC LIMIT 200`);
+export async function retrieveLessons(segment: Segment, icpKey: string): Promise<{ applied: Applied[]; promptBlock: string }> {
+  const rows = await sql(`SELECT * FROM lessons WHERE jsonb_array_length(rules) > 0 AND icp_key = $1 ORDER BY updated_at DESC LIMIT 200`, [icpKey]);
   const scored = rows
     .map((lesson, recency) => {
       const same = [
         lesson.persona === segment.persona ? "same kind of contact" : null,
-        lesson.framework === segment.framework ? `same certification (${segment.framework})` : null,
+        lesson.framework === segment.framework ? `same angle (${segment.framework})` : null,
         lesson.stage === segment.stage ? `same stage (${segment.stage})` : null,
       ].filter(Boolean) as string[];
       const score = (lesson.persona === segment.persona ? 3 : 0) + (lesson.framework === segment.framework ? 2 : 0) + (lesson.stage === segment.stage ? 2 : 0) + (lesson.sent ? 1 : 0);
@@ -202,10 +202,12 @@ ${scored
 // ------------------------------------------------------------------- stats
 
 /** Numbers for the dashboard: is the delta between draft and sent shrinking? */
-export async function feedbackStats() {
-  const lessons = await sql(`SELECT * FROM lessons ORDER BY created_at ASC`);
+export async function feedbackStats(icpKey: string) {
+  const lessons = await sql(`SELECT * FROM lessons WHERE icp_key = $1 ORDER BY created_at ASC`, [icpKey]);
   const untouched = await sql(
-    `SELECT count(*)::int AS n FROM drafts d WHERE d.status <> 'draft' AND NOT EXISTS (SELECT 1 FROM lessons l WHERE l.draft_id = d.id)`,
+    `SELECT count(*)::int AS n FROM drafts d JOIN companies c ON c.id = d.company_id
+     WHERE c.icp_key = $1 AND d.status <> 'draft' AND NOT EXISTS (SELECT 1 FROM lessons l WHERE l.draft_id = d.id)`,
+    [icpKey],
   );
   const average = (rows: Row[]) => (rows.length ? Math.round((rows.reduce((sum, r) => sum + Number(r.delta_body), 0) / rows.length) * 100) : null);
   return {

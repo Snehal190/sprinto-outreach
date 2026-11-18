@@ -174,6 +174,12 @@ const SCHEMA = [
      hints JSONB NOT NULL DEFAULT '[]',
      fetched_at TIMESTAMPTZ NOT NULL DEFAULT now()
    )`,
+  // Companies and lessons belong to the ICP they were found under (icp.ts).
+  // "default" is the built-in ICP; the same website may appear under several ICPs.
+  `ALTER TABLE companies ADD COLUMN IF NOT EXISTS icp_key TEXT NOT NULL DEFAULT 'default'`,
+  `ALTER TABLE companies DROP CONSTRAINT IF EXISTS companies_domain_key`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS companies_domain_icp ON companies (domain, icp_key)`,
+  `ALTER TABLE lessons ADD COLUMN IF NOT EXISTS icp_key TEXT NOT NULL DEFAULT 'default'`,
 ];
 
 async function connect(): Promise<Query> {
