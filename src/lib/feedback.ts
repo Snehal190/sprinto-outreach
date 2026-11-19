@@ -167,7 +167,7 @@ const MAX_LESSONS = 5;
  * lessons learned under the same ICP are used.
  */
 export async function retrieveLessons(segment: Segment, icpKey: string): Promise<{ applied: Applied[]; promptBlock: string }> {
-  const rows = await sql(`SELECT * FROM lessons WHERE jsonb_array_length(rules) > 0 AND icp_key = $1 ORDER BY updated_at DESC LIMIT 200`, [icpKey]);
+  const rows = await sql(`SELECT * FROM lessons WHERE (jsonb_array_length(rules) > 0 OR feedback <> '') AND icp_key = $1 ORDER BY updated_at DESC LIMIT 200`, [icpKey]);
   const scored = rows
     .map((lesson, recency) => {
       const same = [
@@ -192,6 +192,7 @@ ${scored
   .map(
     ({ lesson, match }, i) =>
       `${i + 1}. [${lesson.persona}, ${lesson.stage}, ${lesson.framework} - ${match}]\n   ${(lesson.rules as string[]).join("\n   ")}` +
+      (lesson.feedback ? `\n   The human's own note: "${lesson.feedback}"` : "") +
       example("Subject", lesson.components?.subject) + example("Hook", lesson.components?.hook) + example("CTA", lesson.components?.cta),
   )
   .join("\n")}

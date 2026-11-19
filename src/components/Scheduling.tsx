@@ -94,21 +94,17 @@ export function ThreadPanel({ thread, rules, run, busy, inbox }: { thread: Threa
   );
 }
 
-export function NotificationsCard({ notices, run, busy, onOpen }: { notices: Notice[]; run: Run; busy: string | null; onOpen: (companyId: number) => void }) {
-  if (notices.length === 0) return null;
+/** The notification bell's panel: what needs the human, newest first. */
+export function NotificationList({ notices, run, busy, onOpen }: { notices: Notice[]; run: Run; busy: string | null; onOpen: (companyId: number) => void }) {
+  if (notices.length === 0) return <p className="px-2 py-6 text-center text-sm text-ink/60">You are all caught up.</p>;
   return (
-    <section className="mt-6 rounded-[2rem] border border-primary/20 bg-blush p-6">
-      <h2 className="font-serif text-3xl tracking-tight">
-        Notifications <span className="italic text-primary">({notices.length})</span>
-      </h2>
-      <ul className="mt-3 space-y-2">
-        {notices.map((n) => (
-          <li key={n.id} className="flex flex-wrap items-center justify-between gap-3 rounded-2xl bg-white px-4 py-3 text-sm">
-            <p className="min-w-0 break-words text-ink">
-              {n.message}
-              <span className="block text-xs text-ink/50">{n.at}</span>
-            </p>
-            <span className="flex shrink-0 gap-2">
+    <ul className="space-y-2">
+      {notices.map((n) => (
+        <li key={n.id} className="rounded-2xl bg-mist px-4 py-3 text-sm">
+          <p className="break-words text-ink">{n.message}</p>
+          <div className="mt-1.5 flex items-center justify-between gap-3">
+            <span className="text-xs text-ink/50">{n.at}</span>
+            <span className="flex shrink-0 gap-3">
               {n.company_id !== null && (
                 <button onClick={() => onOpen(n.company_id!)} className="text-xs font-bold uppercase tracking-wider text-primary hover:underline">
                   Open
@@ -118,9 +114,9 @@ export function NotificationsCard({ notices, run, busy, onOpen }: { notices: Not
                 Dismiss
               </button>
             </span>
-          </li>
-        ))}
-      </ul>
-    </section>
+          </div>
+        </li>
+      ))}
+    </ul>
   );
 }

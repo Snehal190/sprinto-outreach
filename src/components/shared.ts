@@ -1,6 +1,6 @@
 // Style strings and types shared by the dashboard components.
 
-export const card = "rounded-[2rem] border border-ink/5 bg-white p-6 sm:p-8";
+export const card = "rounded-[2rem] border border-ink/5 bg-white p-6 shadow-sm shadow-ink/[0.04] sm:p-8";
 export const label = "text-[11px] font-bold uppercase tracking-widest text-ink/50";
 export const field =
   "w-full rounded-2xl border border-ink/10 bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/15";

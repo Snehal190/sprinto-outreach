@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { NotificationsCard, ThreadPanel } from "./Scheduling";
+import { NotificationList, ThreadPanel } from "./Scheduling";
 import { card, field, ghostBtn, label, primaryBtn, type CalendarEvent, type Notice, type Rules, type Run, type Thread } from "./shared";
 
 type Contact = {
@@ -87,7 +87,7 @@ type Company = {
 type Settings = { icp: string; product: string; companyName: string; senderName: string; senderTitle: string };
 
 /** What the funnel is doing for the current ICP (built from it in icp.ts). */
-type Profile = { summary: string; custom: boolean; leadWith: string; incumbent: string; questions: string[] };
+type Profile = { summary: string; custom: boolean; leadWith: string; incumbent: string; questions: string[]; rubric: string[]; threshold: number };
 
 const DEFAULT_ICP: Pick<Settings, "icp" | "product" | "companyName"> = {
   icp: "SaaS companies, typically Series A-C, that are either preparing for a compliance audit or are under pressure from enterprise customers to get certified.",
@@ -120,6 +120,8 @@ export default function Dashboard() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [tab, setTab] = useState<"funnel" | "qualified">("funnel");
+  const [bellOpen, setBellOpen] = useState(false);
 
   useEffect(() => {
     fetch("/api/state")
@@ -184,7 +186,13 @@ export default function Dashboard() {
       if (action === "checkInbox") {
         setNotice(data.result.handled ? `Handled ${data.result.handled} new repl${data.result.handled === 1 ? "y" : "ies"} from the inbox.` : "No new replies in the inbox.");
       }
-      if (action === "saveDraft") {
+      if (action === "saveDraft" && busyKey === "saveFeedback") {
+        setNotice(
+          data.result.captureError
+            ? `Feedback saved, but it could not be analysed yet: ${data.result.captureError}`
+            : "Feedback saved. Future drafts for similar prospects will take it into account.",
+        );
+      } else if (action === "saveDraft") {
         setNotice(
           data.result.captureError
             ? `Saved, but the feedback loop could not analyse the edit: ${data.result.captureError}`
@@ -243,19 +251,22 @@ export default function Dashboard() {
   const queued = count((c) => c.scrape_status === "pending");
   const visible = companies.filter((c) => filter === "all" || c.status === filter);
   const selected = companies.find((c) => c.id === selectedId) ?? visible[0] ?? null;
+  const qualified = companies.filter((c) => c.status === "shortlisted");
 
   return (
     <div className="relative overflow-x-clip">
       <div className="pointer-events-none absolute -right-40 -top-40 h-[30rem] w-[30rem] rounded-full bg-primary/10 blur-[120px]" />
       <div className="pointer-events-none absolute -left-40 top-[40rem] h-[26rem] w-[26rem] rounded-full bg-primary/10 blur-[100px]" />
 
-      <header className="fixed inset-x-0 top-0 z-20 border-b border-ink/5 bg-white/80 backdrop-blur-[12px]">
+      <header className="fixed inset-x-0 top-0 z-20 border-b border-ink/5 bg-white/85 backdrop-blur-[12px]">
         <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-3 sm:px-8">
           <div className="group flex items-center gap-3">
-            <span className="flex h-9 w-9 rotate-3 items-center justify-center rounded-lg bg-primary font-serif text-xl font-bold italic text-white transition duration-300 group-hover:rotate-12">
-              {(state.settings.companyName || "S").charAt(0).toUpperCase()}
+            <span className="flex h-9 w-9 rotate-3 items-center justify-center rounded-lg bg-primary font-serif text-xl font-bold italic text-white shadow-md shadow-primary/30 transition duration-300 group-hover:rotate-12">
+              O
             </span>
-            <span className="text-sm font-bold text-ink">{state.settings.companyName || "Sprinto"} Outreach</span>
+            <span className="text-sm font-bold text-ink">
+              Outreach
+            </span>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             {state.apis.map((a) => (
@@ -276,6 +287,47 @@ export default function Dashboard() {
             >
               {busy === "testApis" ? "Testing…" : "Test APIs"}
             </button>
+            <div className="relative">
+              <button
+                aria-label={`Notifications (${state.notifications.length})`}
+                aria-expanded={bellOpen}
+                onClick={() => setBellOpen((o) => !o)}
+                className={`relative flex h-9 w-9 items-center justify-center rounded-full border transition ${bellOpen ? "border-primary bg-blush text-primary" : "border-ink/10 bg-white text-ink/70 hover:border-primary hover:text-primary"}`}
+              >
+                <svg viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                  <path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
+                  <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
+                </svg>
+                {state.notifications.length > 0 && (
+                  <span className="absolute -right-1 -top-1 flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-white">
+                    {state.notifications.length}
+                  </span>
+                )}
+              </button>
+              {bellOpen && (
+                <div className="absolute right-0 top-12 z-30 w-[min(24rem,calc(100vw-2rem))] rounded-3xl border border-ink/5 bg-white p-4 shadow-2xl shadow-ink/10">
+                  <div className="mb-3 flex items-center justify-between px-1">
+                    <p className="font-serif text-2xl">Notifications</p>
+                    <button onClick={() => setBellOpen(false)} className="text-xs font-bold uppercase tracking-wider text-ink/50 hover:text-ink">
+                      Close
+                    </button>
+                  </div>
+                  <div className="max-h-[60vh] overflow-y-auto">
+                    <NotificationList
+                      notices={state.notifications}
+                      run={run}
+                      busy={busy}
+                      onOpen={(companyId) => {
+                        setTab("funnel");
+                        setFilter("all");
+                        setSelectedId(companyId);
+                        setBellOpen(false);
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </header>
@@ -294,7 +346,7 @@ export default function Dashboard() {
 
         <section className="mt-12 grid animate-fade-up grid-cols-2 gap-3 sm:grid-cols-5">
           {stats.map((s, i) => (
-            <div key={s.name} className="rounded-3xl border border-ink/5 bg-white p-5">
+            <div key={s.name} className="rounded-3xl border border-ink/5 bg-white p-5 shadow-sm shadow-ink/[0.03]">
               <p className={label}>
                 {i + 1}. {s.name}
               </p>
@@ -309,16 +361,6 @@ export default function Dashboard() {
           </div>
         )}
 
-        <NotificationsCard
-          notices={state.notifications}
-          run={run}
-          busy={busy}
-          onOpen={(companyId) => {
-            setFilter("all");
-            setSelectedId(companyId);
-          }}
-        />
-
         {(error || notice) && (
           <div
             role="status"
@@ -328,6 +370,38 @@ export default function Dashboard() {
           </div>
         )}
 
+        <nav className="mt-10 flex justify-center" aria-label="Views">
+          <div className="inline-flex gap-1 rounded-full border border-ink/5 bg-white p-1 shadow-sm shadow-ink/[0.04]">
+            {(
+              [
+                ["funnel", "Funnel"],
+                ["qualified", `Qualified · ${qualified.length}`],
+              ] as const
+            ).map(([key, name]) => (
+              <button
+                key={key}
+                onClick={() => setTab(key)}
+                aria-pressed={tab === key}
+                className={`rounded-full px-5 py-2 text-xs font-bold uppercase tracking-wider transition ${tab === key ? "bg-primary text-white shadow-md shadow-primary/25" : "text-ink/60 hover:text-primary"}`}
+              >
+                {name}
+              </button>
+            ))}
+          </div>
+        </nav>
+
+        {tab === "qualified" ? (
+          <QualifiedView
+            companies={qualified}
+            threshold={state.profile.threshold}
+            onOpen={(id) => {
+              setTab("funnel");
+              setFilter("all");
+              setSelectedId(id);
+            }}
+          />
+        ) : (
+          <>
         <SettingsCard key={JSON.stringify(state.settings)} settings={state.settings} profile={state.profile} run={run} busy={busy} />
 
         <section className="mt-8 grid gap-6 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]">
@@ -394,13 +468,87 @@ export default function Dashboard() {
             <div className={`${card} flex items-center justify-center text-sm text-ink/60`}>Select a company to see its POC and draft.</div>
           )}
         </section>
-
+          </>
+        )}
       </main>
     </div>
   );
 }
 
-/** One API's last test: green when working, maroon when failing, grey when not set up. Hover for the detail. */
+/** Where a qualified company is in the funnel right now, in a few words. */
+function stageOf(c: Company): { text: string; tone: "done" | "live" | "todo" | "alert" } {
+  if (c.thread?.needs_human) return { text: c.thread.status_label, tone: "alert" };
+  if (c.thread?.state.meeting_status === "confirmed") return { text: "Call scheduled", tone: "done" };
+  if (c.thread) return { text: c.thread.status_label, tone: "live" };
+  if (c.draft && c.draft.status !== "draft") return { text: c.draft.status === "sent" ? "Email sent" : "Send simulated", tone: "live" };
+  if (c.draft) return { text: "Email drafted", tone: "todo" };
+  if (c.contact) return { text: "POC found", tone: "todo" };
+  if (c.scrape_status === "pending") return { text: "Researching", tone: "todo" };
+  return { text: "Find the POC", tone: "todo" };
+}
+
+function QualifiedView({ companies, threshold, onOpen }: { companies: Company[]; threshold: number; onOpen: (id: number) => void }) {
+  const tone = {
+    done: "bg-emerald-50 text-emerald-800 ring-emerald-200",
+    live: "bg-blush text-primary ring-primary/20",
+    todo: "bg-mist text-ink/70 ring-ink/10",
+    alert: "bg-primary text-white ring-primary",
+  };
+  const booked = companies.filter((c) => c.thread?.state.meeting_status === "confirmed").length;
+  return (
+    <section className={`${card} mt-6 animate-fade-up`}>
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <h2 className="font-serif text-4xl tracking-tight">
+            Qualified <span className="italic text-primary">companies</span>
+          </h2>
+          <p className="mt-2 max-w-2xl text-sm text-ink/60">
+            Every company that scored {threshold} or more against the ICP (or that you shortlisted by hand), and where it stands now.
+          </p>
+        </div>
+        <p className="text-sm text-ink/60">
+          <span className="font-serif text-4xl text-ink">{booked}</span> call{booked === 1 ? "" : "s"} scheduled
+        </p>
+      </div>
+      {companies.length === 0 ? (
+        <p className="mt-6 rounded-3xl bg-mist px-5 py-8 text-center text-sm text-ink/70">No company has qualified yet. Press “Find companies” in the Funnel tab.</p>
+      ) : (
+        <ul className="mt-6 divide-y divide-ink/5">
+          {companies.map((c) => {
+            const stage = stageOf(c);
+            return (
+              <li key={c.id}>
+                <button onClick={() => onOpen(c.id)} className="grid w-full gap-3 rounded-2xl px-3 py-4 text-left transition hover:bg-mist/60 sm:grid-cols-[3.5rem_minmax(0,3fr)_minmax(0,3fr)_minmax(0,4fr)] sm:items-center">
+                  <span className="font-serif text-4xl leading-none text-primary">{c.fit_score ?? "–"}</span>
+                  <span className="min-w-0">
+                    <span className="block truncate font-bold text-ink">{c.name}</span>
+                    <span className="block truncate text-xs text-ink/50">{c.domain}</span>
+                  </span>
+                  <span className="min-w-0 text-sm text-ink/80">
+                    {c.contact ? (
+                      <>
+                        <span className="block truncate font-semibold">{`${c.contact.first_name} ${c.contact.last_name}`.trim()}</span>
+                        <span className="block truncate text-xs text-ink/50">{c.contact.title}</span>
+                      </>
+                    ) : (
+                      <span className="text-ink/40">No POC yet</span>
+                    )}
+                  </span>
+                  <span className="min-w-0">
+                    <span className={`inline-block rounded-full px-3 py-1 text-[11px] font-bold ring-1 ${tone[stage.tone]}`}>{stage.text}</span>
+                    {c.thread?.status_detail && <span className="mt-1 block truncate text-xs text-ink/60">{c.thread.status_detail}</span>}
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+/** One API's last test: green when working, red when failing, grey when not set up. Hover for the detail. */
 function ApiPill({ status }: { status: ApiStatus }) {
   const tested = status.checkedAt !== "";
   const dot = !tested ? "bg-ink/20 animate-pulse" : status.ok ? "bg-emerald-600" : status.off ? "bg-ink/30" : "bg-primary";
@@ -442,17 +590,17 @@ function SettingsCard({ settings, profile, run, busy }: { settings: Settings; pr
   const dirty = JSON.stringify(form) !== JSON.stringify(settings);
   const set = (k: keyof Settings) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) =>
     setForm({ ...form, [k]: e.target.value });
-  const dark = "w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-white outline-none transition placeholder:text-white/30 focus:border-white/40";
-  const darkLabel = "text-[11px] font-bold uppercase tracking-widest text-white/50";
+  const dark = `${field} placeholder:text-ink/35`;
+  const darkLabel = label;
 
   return (
-    <section className="mt-8 rounded-[3rem] bg-ink p-6 text-white sm:p-10">
+    <section className="mt-8 rounded-[3rem] border border-ink/5 bg-mist p-6 text-ink sm:p-10">
       <div className="grid gap-8 lg:grid-cols-[minmax(0,7fr)_minmax(0,5fr)]">
         <div>
           <h2 className="font-serif text-5xl tracking-tight">
             The <span className="italic">ideal customer</span>
           </h2>
-          <p className="mt-3 max-w-xl text-sm leading-relaxed text-white/60">
+          <p className="mt-3 max-w-xl text-sm leading-relaxed text-ink/60">
             Describe who you sell to and what you sell. Every step (search, website research, scoring, the contact to find and the email) follows it.
           </p>
           <label className="mt-6 block">
@@ -469,22 +617,39 @@ function SettingsCard({ settings, profile, run, busy }: { settings: Settings; pr
               <textarea rows={2} value={form.product} onChange={set("product")} className={`${dark} mt-2`} />
             </label>
           </div>
-          <div className="mt-4 rounded-2xl bg-white/5 px-4 py-3 text-sm text-white/70">
+          <div className="mt-4 rounded-2xl bg-white px-4 py-3 text-sm text-ink/70">
             {icpChanged ? (
               <>Save to set the funnel up for this ICP (about 20 seconds). Companies found for other ICPs are kept but hidden; saving that ICP again brings them back.</>
             ) : (
               <>
-                <span className="font-semibold text-white">Targeting:</span> {profile.summary}.{" "}
-                <span className="font-semibold text-white">Qualifies on:</span> {profile.questions.join("; ")}.
+                <span className="font-semibold text-ink">Targeting:</span> {profile.summary}.{" "}
+                <span className="font-semibold text-ink">Qualifies on:</span> {profile.questions.join("; ")}.
               </>
             )}
           </div>
+          {!icpChanged && (
+            <details className="mt-3 rounded-2xl bg-white px-4 py-3 text-sm text-ink/70">
+              <summary className="cursor-pointer font-semibold text-ink">
+                How a company qualifies: a fit score of <span className="text-primary">{profile.threshold}/100</span> or more
+              </summary>
+              <p className="mt-2">Each company is scored out of 100 against the ICP with these rules, most important first:</p>
+              <ol className="mt-2 list-decimal space-y-1 pl-5">
+                {profile.rubric.map((r, i) => (
+                  <li key={i}>{r}</li>
+                ))}
+              </ol>
+              <p className="mt-2">
+                {profile.threshold} or more is shortlisted (qualified); below that it goes to “Below bar”. A company that fails a must-have question on its website
+                gets 10. You can always shortlist or reject by hand.
+              </p>
+            </details>
+          )}
           {!isDefault && (
             <button
               type="button"
               disabled={busy !== null}
               onClick={() => setForm({ ...form, ...DEFAULT_ICP })}
-              className="mt-3 text-xs font-bold uppercase tracking-wider text-white/50 hover:text-white"
+              className="mt-3 text-xs font-bold uppercase tracking-wider text-ink/50 hover:text-primary"
             >
               Reset to the default ICP
             </button>
@@ -499,7 +664,7 @@ function SettingsCard({ settings, profile, run, busy }: { settings: Settings; pr
           <button
             disabled={!dirty || busy !== null}
             onClick={() => run("saveSettings", { settings: form })}
-            className="mt-3 self-start rounded-[30px] border-2 border-white/20 px-5 py-2.5 text-xs font-bold uppercase tracking-wider transition hover:border-white disabled:opacity-40"
+            className={`${ghostBtn} mt-3 self-start bg-white`}
           >
             {busy === "saveSettings" ? (icpChanged ? "Setting up the ICP…" : "Saving…") : dirty ? (icpChanged ? "Save and set up ICP" : "Save changes") : "Saved"}
           </button>
@@ -509,7 +674,7 @@ function SettingsCard({ settings, profile, run, busy }: { settings: Settings; pr
             <div className="mt-2 flex flex-wrap items-center gap-3">
               <select aria-label="How many companies" value={count} onChange={(e) => setCount(Number(e.target.value))} className={`${dark} w-auto`}>
                 {[3, 5, 8, 10].map((n) => (
-                  <option key={n} value={n} className="text-ink">
+                  <option key={n} value={n}>
                     {n} companies
                   </option>
                 ))}
@@ -518,7 +683,7 @@ function SettingsCard({ settings, profile, run, busy }: { settings: Settings; pr
                 {busy === "discover" ? "Searching… about a minute" : "Find companies"}
               </button>
             </div>
-            {dirty && <p className="mt-2 text-xs text-white/50">Save your changes before searching.</p>}
+            {dirty && <p className="mt-2 text-xs text-ink/50">Save your changes before searching.</p>}
 
             <label className="mt-6 block">
               <span className={darkLabel}>Or paste your own company websites, one per line</span>
@@ -561,6 +726,11 @@ function Detail({ company: c, run, busy, config, rules, profile }: { company: Co
       : []),
   ];
   const working = busy !== null;
+  // Which sections are minimised. Kept while you move between companies.
+  const [closed, setClosed] = useState<Record<string, boolean>>({});
+  const toggle = (name: string) => setClosed((x) => ({ ...x, [name]: !x[name] }));
+  const sections = ["research", "poc", ...(c.contact ? ["draft"] : [])];
+  const allClosed = sections.every((n) => closed[n]);
 
   return (
     <div className={`${card} animate-fade-up`} key={c.id}>
@@ -590,6 +760,13 @@ function Detail({ company: c, run, busy, config, rules, profile }: { company: Co
             className={ghostBtn}
           >
             Remove
+          </button>
+          <button
+            onClick={() => setClosed(Object.fromEntries(sections.map((n) => [n, !allClosed])))}
+            className={ghostBtn}
+            title={allClosed ? "Expand research, POC and draft" : "Minimise research, POC and draft"}
+          >
+            {allClosed ? "Expand all" : "Minimise all"}
           </button>
         </div>
       </div>
@@ -636,12 +813,12 @@ function Detail({ company: c, run, busy, config, rules, profile }: { company: Co
       <hr className="my-7 border-ink/5" />
 
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <h3 className="font-serif text-3xl">Website research</h3>
+        <SectionTitle title="Website research" open={!closed.research} onToggle={() => toggle("research")} />
         <button disabled={working} onClick={() => run("scrape", { id: c.id }, `scrape-${c.id}`)} className={ghostBtn}>
           {busy === `scrape-${c.id}` ? "Researching… up to 2 min" : c.scrape_summary ? "Research again" : "Research website"}
         </button>
       </div>
-      {c.scrape_summary ? (
+      {closed.research ? null : c.scrape_summary ? (
         <div className="mt-3">
           <p className="text-sm font-semibold text-ink">
             {c.scrape_summary.exitText}
@@ -678,12 +855,12 @@ function Detail({ company: c, run, busy, config, rules, profile }: { company: Co
       <hr className="my-7 border-ink/5" />
 
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <h3 className="font-serif text-3xl">Point of contact</h3>
+        <SectionTitle title="Point of contact" open={!closed.poc} onToggle={() => toggle("poc")} />
         <button disabled={working} onClick={() => run("findPoc", { id: c.id }, `poc-${c.id}`)} className={c.contact ? ghostBtn : primaryBtn}>
           {busy === `poc-${c.id}` ? "Finding and researching…" : c.contact ? "Find again" : "Find POC"}
         </button>
       </div>
-      {c.contact ? (
+      {closed.poc ? null : c.contact ? (
         <ContactEditor key={JSON.stringify(c.contact)} contact={c.contact} companyId={c.id} run={run} busy={busy} />
       ) : (
         <p className="mt-3 text-sm text-ink/60">
@@ -696,7 +873,7 @@ function Detail({ company: c, run, busy, config, rules, profile }: { company: Co
         <>
           <hr className="my-7 border-ink/5" />
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <h3 className="font-serif text-3xl">Email draft</h3>
+            <SectionTitle title="Email draft" open={!closed.draft} onToggle={() => toggle("draft")} />
             <button
               disabled={working || c.draft?.status === "sent"}
               onClick={() => {
@@ -707,7 +884,7 @@ function Detail({ company: c, run, busy, config, rules, profile }: { company: Co
               {busy === `draft-${c.id}` ? "Writing…" : c.draft ? "Regenerate" : "Draft email"}
             </button>
           </div>
-          {c.draft ? (
+          {closed.draft ? null : c.draft ? (
             <DraftEditor key={`${c.draft.id}-${c.draft.updated_at}-${c.draft.status}`} draft={c.draft} contact={c.contact} run={run} busy={busy} config={config} />
           ) : (
             <p className="mt-3 text-sm text-ink/60">Writes a personalised email with a hook and both pain points.</p>
@@ -723,6 +900,24 @@ function Detail({ company: c, run, busy, config, rules, profile }: { company: Co
         </>
       )}
     </div>
+  );
+}
+
+/** A section heading that minimises its section when clicked. */
+function SectionTitle({ title, open, onToggle }: { title: string; open: boolean; onToggle: () => void }) {
+  return (
+    <button onClick={onToggle} aria-expanded={open} className="group flex items-center gap-3 text-left" title={open ? "Minimise" : "Expand"}>
+      <span
+        className={`flex h-7 w-7 items-center justify-center rounded-full border border-ink/10 text-ink/50 transition duration-300 group-hover:border-primary group-hover:text-primary ${open ? "" : "-rotate-90"}`}
+        aria-hidden
+      >
+        <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="m6 9 6 6 6-6" />
+        </svg>
+      </span>
+      <h3 className="font-serif text-3xl">{title}</h3>
+      {!open && <span className="text-[11px] font-bold uppercase tracking-wider text-ink/40">Minimised</span>}
+    </button>
   );
 }
 
@@ -828,6 +1023,7 @@ function DraftEditor({ draft, contact, run, busy, config }: { draft: Draft; cont
   const [feedback, setFeedback] = useState(draft.feedback);
   const done = draft.status !== "draft";
   const dirty = subject !== draft.subject || body !== draft.body || feedback !== draft.feedback;
+  const feedbackDirty = feedback.trim() !== (draft.feedback ?? "").trim();
   const edited = draft.subject !== draft.original_subject || draft.body !== draft.original_body;
   const words = body.trim().split(/\s+/).filter(Boolean).length;
 
@@ -892,21 +1088,30 @@ function DraftEditor({ draft, contact, run, busy, config }: { draft: Draft; cont
         <textarea rows={13} value={body} disabled={done} onChange={(e) => setBody(e.target.value)} className={`${field} mt-1 leading-relaxed disabled:bg-ink/5`} />
       </label>
       <label className="mt-4 block">
-        <span className={label}>Feedback: what was wrong with the draft?</span>
+        <span className={label}>Feedback: what was wrong with the draft? (optional)</span>
         <textarea
           rows={3}
           value={feedback}
-          disabled={done}
           placeholder="e.g. The hook was too generic, and the tone was too formal for a founder."
           onChange={(e) => setFeedback(e.target.value)}
-          className={`${field} mt-1 disabled:bg-ink/5`}
+          className={`${field} mt-1`}
         />
       </label>
+      <div className="mt-2 flex flex-wrap items-center gap-3">
+        <button
+          disabled={busy !== null || !feedbackDirty}
+          onClick={() => run("saveDraft", { id: draft.id, draft: { feedback } }, "saveFeedback")}
+          className={ghostBtn}
+        >
+          {busy === "saveFeedback" ? "Saving and learning…" : feedbackDirty ? "Save feedback" : draft.feedback ? "Feedback saved" : "Save feedback"}
+        </button>
+        <span className="text-xs text-ink/50">Saved notes are learned from, so the next drafts for similar prospects avoid the same problem.</span>
+      </div>
 
       {draft.lesson && (
         <div className="mt-4 rounded-2xl bg-blush px-4 py-4 text-sm">
           <p className={label}>
-            What the system learned from your changes · {Math.round(draft.lesson.delta_body * 100)}% of the email rewritten
+            What the system learned from your changes and feedback · {Math.round(draft.lesson.delta_body * 100)}% of the email rewritten
           </p>
           <ul className="mt-2 space-y-2">
             {(["subject", "hook", "angle", "cta"] as const).map((name) => {
@@ -921,6 +1126,12 @@ function DraftEditor({ draft, contact, run, busy, config }: { draft: Draft; cont
               );
             })}
             {draft.lesson.tone && <li className="text-ink/80">Tone: {draft.lesson.tone}</li>}
+            {draft.lesson.rules.map((r, i) => (
+              <li key={`rule-${i}`} className="flex gap-2 text-ink">
+                <span className="text-primary">✦</span>
+                {r}
+              </li>
+            ))}
             {draft.lesson.rules.length === 0 && <li className="text-ink/60">No general lesson taken (looks like a one-off correction).</li>}
           </ul>
         </div>

@@ -1,4 +1,4 @@
-# Outreach Funnel
+# Outreach
 
 An outreach funnel for any B2B seller. You describe your ICP, your company and what you sell; it finds companies that fit, researches them and the right contact, drafts a personalised email for a human to approve, and handles the reply and meeting booking after the email is sent.
 

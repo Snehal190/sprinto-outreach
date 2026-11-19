@@ -11,7 +11,7 @@ const instrumentSerif = Instrument_Serif({
 });
 
 export const metadata: Metadata = {
-  title: "Outreach Funnel",
+  title: "Outreach",
   description: "ICP-driven prospecting funnel: shortlist, find the POC, draft, review and send.",
 };
 

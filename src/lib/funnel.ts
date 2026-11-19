@@ -61,7 +61,7 @@ export async function getState() {
       draft: withLesson(drafts.find((d) => d.company_id === c.id)),
       thread: scheduling.threads.find((t) => t.company_id === c.id) ?? null,
     })),
-    profile: { summary: profile.summary, custom: profile.custom, leadWith: profile.leadWith.label, incumbent: profile.incumbent.label, questions: profile.questions.map((q) => q.label) },
+    profile: { summary: profile.summary, custom: profile.custom, leadWith: profile.leadWith.label, incumbent: profile.incumbent.label, questions: profile.questions.map((q) => q.label), rubric: profile.rubric, threshold: SHORTLIST_THRESHOLD },
     notifications: scheduling.notifications.filter((n) => n.company_id === null || visible.has(n.company_id)),
     calendar: scheduling.calendar,
     rules: scheduling.rules,
@@ -624,7 +624,12 @@ export async function saveDraft(id: number, patch: { subject?: string; body?: st
   const rows = await sql(`SELECT * FROM drafts WHERE id = $1`, [id]);
   const draft = rows[0];
   if (!draft) throw new Error("Draft not found");
-  if (draft.status !== "draft") throw new Error("This email has already been sent and can no longer be edited");
+  // After the send the email is final, but a note on what was wrong with it
+  // can still be added: it is saved and the lesson is updated from it.
+  const sent = draft.status !== "draft";
+  if (sent && ((patch.subject ?? draft.subject) !== draft.subject || (patch.body ?? draft.body) !== draft.body)) {
+    throw new Error("This email has already been sent and can no longer be edited");
+  }
 
   const subject = patch.subject ?? draft.subject;
   const body = patch.body ?? draft.body;
@@ -647,6 +652,7 @@ export async function saveDraft(id: number, patch: { subject?: string; body?: st
   if (textChanged || feedback !== draft.feedback) {
     try {
       learned = (await captureLesson(id)).learned;
+      if (sent) await markSent(id);
     } catch (err) {
       console.error("Feedback capture failed:", err);
       captureError = (err as Error).message;
@@ -673,6 +679,18 @@ export async function sendDraft(id: number) {
   }
 
   const result = await deliver({ subject: draft.subject, body: draft.body, prospectEmail: contact?.email ?? null });
+  // Feedback loop trigger on send: the version that went out is the final one.
+  // If the human changed the email or wrote a note and no lesson was captured
+  // yet (or the last capture failed), capture it now from the sent version.
+  const edited = draft.subject !== draft.original_subject || draft.body !== draft.original_body || String(draft.feedback ?? "").trim() !== "";
+  const hasLesson = (await sql(`SELECT 1 FROM lessons WHERE draft_id = $1`, [id])).length > 0;
+  if (edited && !hasLesson) {
+    try {
+      await captureLesson(id);
+    } catch (err) {
+      console.error("Feedback capture on send failed:", err);
+    }
+  }
   await markSent(id);
   if (result.mode === "live") await sql(`UPDATE drafts SET status = 'sent', sent_at = now() WHERE id = $1`, [id]);
   if (result.mode === "simulated") await sql(`UPDATE drafts SET status = 'simulated', sent_at = now() WHERE id = $1`, [id]);
