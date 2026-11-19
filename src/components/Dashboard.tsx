@@ -676,15 +676,25 @@ function SettingsCard({ settings, profile, run, busy }: { settings: Settings; pr
 
           <div className="mt-auto pt-8">
             <span className={darkLabel}>Search the web for matching companies</span>
-            <div className="mt-2 flex flex-wrap items-center gap-3">
-              <select aria-label="How many companies" value={count} onChange={(e) => setCount(Number(e.target.value))} className={`${dark.replace("w-full", "")} w-44 shrink-0 pr-10`}>
-                {[3, 5, 8, 10].map((n) => (
-                  <option key={n} value={n}>
-                    {n} companies
-                  </option>
-                ))}
-              </select>
-              <button disabled={busy !== null || dirty} onClick={() => run("discover", { count })} className={primaryBtn}>
+            <div className="mt-3 flex flex-wrap items-center gap-3">
+              <div className="relative h-12 w-40 shrink-0">
+                <select
+                  aria-label="How many companies"
+                  value={count}
+                  onChange={(e) => setCount(Number(e.target.value))}
+                  className="h-12 w-full cursor-pointer appearance-none rounded-full border border-ink/10 bg-white pl-5 pr-10 text-sm font-semibold leading-none text-ink outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/15"
+                >
+                  {[3, 5, 8, 10].map((n) => (
+                    <option key={n} value={n}>
+                      {n} companies
+                    </option>
+                  ))}
+                </select>
+                <svg viewBox="0 0 24 24" aria-hidden className="pointer-events-none absolute right-4 top-1/2 h-4 w-4 -translate-y-1/2 text-ink/50" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="m6 9 6 6 6-6" />
+                </svg>
+              </div>
+              <button disabled={busy !== null || dirty} onClick={() => run("discover", { count })} className={`${primaryBtn} h-12`}>
                 {busy === "discover" ? "Searching… about a minute" : "Find companies"}
               </button>
             </div>
