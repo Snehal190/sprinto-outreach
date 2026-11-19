@@ -180,6 +180,23 @@ const SCHEMA = [
   `ALTER TABLE companies DROP CONSTRAINT IF EXISTS companies_domain_key`,
   `CREATE UNIQUE INDEX IF NOT EXISTS companies_domain_icp ON companies (domain, icp_key)`,
   `ALTER TABLE lessons ADD COLUMN IF NOT EXISTS icp_key TEXT NOT NULL DEFAULT 'default'`,
+  // Structured tags (kept in sync by tags.ts), so the database can be queried
+  // directly for where each company stands, without reading JSON.
+  `ALTER TABLE companies ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT 'found'`,
+  `ALTER TABLE companies ADD COLUMN IF NOT EXISTS qualified BOOLEAN NOT NULL DEFAULT FALSE`,
+  `ALTER TABLE companies ADD COLUMN IF NOT EXISTS qualified_at TIMESTAMPTZ`,
+  `ALTER TABLE companies ADD COLUMN IF NOT EXISTS stage_updated_at TIMESTAMPTZ`,
+  `CREATE INDEX IF NOT EXISTS companies_icp_stage ON companies (icp_key, stage)`,
+  `ALTER TABLE threads ADD COLUMN IF NOT EXISTS reply_status TEXT`,
+  `ALTER TABLE threads ADD COLUMN IF NOT EXISTS meeting_status TEXT`,
+  `ALTER TABLE threads ADD COLUMN IF NOT EXISTS meeting_start TIMESTAMPTZ`,
+  `ALTER TABLE threads ADD COLUMN IF NOT EXISTS meeting_end TIMESTAMPTZ`,
+  `ALTER TABLE threads ADD COLUMN IF NOT EXISTS meeting_link TEXT`,
+  `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS company_id INT REFERENCES companies(id) ON DELETE CASCADE`,
+  `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS kind TEXT`,
+  `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ`,
+  `ALTER TABLE drafts ADD COLUMN IF NOT EXISTS edited BOOLEAN NOT NULL DEFAULT FALSE`,
+  `ALTER TABLE drafts ADD COLUMN IF NOT EXISTS feedback_saved_at TIMESTAMPTZ`,
 ];
 
 async function connect(): Promise<Query> {

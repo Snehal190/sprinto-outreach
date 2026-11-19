@@ -252,6 +252,7 @@ export default function Dashboard() {
   const visible = companies.filter((c) => filter === "all" || c.status === filter);
   const selected = companies.find((c) => c.id === selectedId) ?? visible[0] ?? null;
   const qualified = companies.filter((c) => c.status === "shortlisted");
+  const unread = state.notifications.filter((n) => !n.read).length;
 
   return (
     <div className="relative overflow-x-clip">
@@ -289,7 +290,7 @@ export default function Dashboard() {
             </button>
             <div className="relative">
               <button
-                aria-label={`Notifications (${state.notifications.length})`}
+                aria-label={`Notifications (${unread} new)`}
                 aria-expanded={bellOpen}
                 onClick={() => setBellOpen((o) => !o)}
                 className={`relative flex h-9 w-9 items-center justify-center rounded-full border transition ${bellOpen ? "border-primary bg-blush text-primary" : "border-ink/10 bg-white text-ink/70 hover:border-primary hover:text-primary"}`}
@@ -298,14 +299,14 @@ export default function Dashboard() {
                   <path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
                   <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
                 </svg>
-                {state.notifications.length > 0 && (
+                {unread > 0 && (
                   <span className="absolute -right-1 -top-1 flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-white">
-                    {state.notifications.length}
+                    {unread}
                   </span>
                 )}
               </button>
               {bellOpen && (
-                <div className="absolute right-0 top-12 z-30 w-[min(24rem,calc(100vw-2rem))] rounded-3xl border border-ink/5 bg-white p-4 shadow-2xl shadow-ink/10">
+                <div className="fixed inset-x-4 top-24 z-30 rounded-3xl sm:absolute sm:inset-x-auto sm:right-0 sm:top-12 sm:w-[24rem] border border-ink/5 bg-white p-4 shadow-2xl shadow-ink/10">
                   <div className="mb-3 flex items-center justify-between px-1">
                     <p className="font-serif text-2xl">Notifications</p>
                     <button onClick={() => setBellOpen(false)} className="text-xs font-bold uppercase tracking-wider text-ink/50 hover:text-ink">
@@ -315,6 +316,7 @@ export default function Dashboard() {
                   <div className="max-h-[60vh] overflow-y-auto">
                     <NotificationList
                       notices={state.notifications}
+                      meetingsDone={new Set(companies.filter((c) => c.thread?.meeting_done).map((c) => c.id))}
                       run={run}
                       busy={busy}
                       onOpen={(companyId) => {
@@ -478,7 +480,7 @@ export default function Dashboard() {
 /** Where a qualified company is in the funnel right now, in a few words. */
 function stageOf(c: Company): { text: string; tone: "done" | "live" | "todo" | "alert" } {
   if (c.thread?.needs_human) return { text: c.thread.status_label, tone: "alert" };
-  if (c.thread?.state.meeting_status === "confirmed") return { text: "Call scheduled", tone: "done" };
+  if (c.thread?.state.meeting_status === "confirmed") return c.thread.meeting_done ? { text: "Meeting done", tone: "done" } : { text: "Call scheduled", tone: "done" };
   if (c.thread) return { text: c.thread.status_label, tone: "live" };
   if (c.draft && c.draft.status !== "draft") return { text: c.draft.status === "sent" ? "Email sent" : "Send simulated", tone: "live" };
   if (c.draft) return { text: "Email drafted", tone: "todo" };
@@ -494,7 +496,8 @@ function QualifiedView({ companies, threshold, onOpen }: { companies: Company[];
     todo: "bg-mist text-ink/70 ring-ink/10",
     alert: "bg-primary text-white ring-primary",
   };
-  const booked = companies.filter((c) => c.thread?.state.meeting_status === "confirmed").length;
+  const booked = companies.filter((c) => c.thread?.state.meeting_status === "confirmed" && !c.thread.meeting_done).length;
+  const met = companies.filter((c) => c.thread?.meeting_done).length;
   return (
     <section className={`${card} mt-6 animate-fade-up`}>
       <div className="flex flex-wrap items-end justify-between gap-4">
@@ -508,6 +511,8 @@ function QualifiedView({ companies, threshold, onOpen }: { companies: Company[];
         </div>
         <p className="text-sm text-ink/60">
           <span className="font-serif text-4xl text-ink">{booked}</span> call{booked === 1 ? "" : "s"} scheduled
+          <span className="mx-3 text-ink/20">|</span>
+          <span className="font-serif text-4xl text-ink">{met}</span> done
         </p>
       </div>
       {companies.length === 0 ? (
@@ -594,7 +599,7 @@ function SettingsCard({ settings, profile, run, busy }: { settings: Settings; pr
   const darkLabel = label;
 
   return (
-    <section className="mt-8 rounded-[3rem] border border-ink/5 bg-mist p-6 text-ink sm:p-10">
+    <section className="mt-8 rounded-[3rem] border border-ink/10 bg-[#e2e4e8] p-6 text-ink sm:p-10">
       <div className="grid gap-8 lg:grid-cols-[minmax(0,7fr)_minmax(0,5fr)]">
         <div>
           <h2 className="font-serif text-5xl tracking-tight">
@@ -672,7 +677,7 @@ function SettingsCard({ settings, profile, run, busy }: { settings: Settings; pr
           <div className="mt-auto pt-8">
             <span className={darkLabel}>Search the web for matching companies</span>
             <div className="mt-2 flex flex-wrap items-center gap-3">
-              <select aria-label="How many companies" value={count} onChange={(e) => setCount(Number(e.target.value))} className={`${dark} w-auto`}>
+              <select aria-label="How many companies" value={count} onChange={(e) => setCount(Number(e.target.value))} className={`${dark.replace("w-full", "")} w-44 shrink-0 pr-10`}>
                 {[3, 5, 8, 10].map((n) => (
                   <option key={n} value={n}>
                     {n} companies

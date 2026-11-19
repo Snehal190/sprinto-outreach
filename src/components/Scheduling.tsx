@@ -94,29 +94,67 @@ export function ThreadPanel({ thread, rules, run, busy, inbox }: { thread: Threa
   );
 }
 
-/** The notification bell's panel: what needs the human, newest first. */
-export function NotificationList({ notices, run, busy, onOpen }: { notices: Notice[]; run: Run; busy: string | null; onOpen: (companyId: number) => void }) {
-  if (notices.length === 0) return <p className="px-2 py-6 text-center text-sm text-ink/60">You are all caught up.</p>;
+const IST = "Asia/Kolkata";
+const dayKey = (d: Date) => new Intl.DateTimeFormat("en-CA", { timeZone: IST, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+
+/** "Today, 3:13 PM", "Yesterday, 9:02 AM" or "Thu 12 Nov, 3:13 PM", all in IST. */
+export function when(iso: string): string {
+  const date = new Date(iso);
+  const time = new Intl.DateTimeFormat("en-US", { timeZone: IST, hour: "numeric", minute: "2-digit" }).format(date);
+  const today = dayKey(new Date());
+  const yesterday = dayKey(new Date(Date.now() - 86_400_000));
+  const day = dayKey(date);
+  if (day === today) return `Today, ${time}`;
+  if (day === yesterday) return `Yesterday, ${time}`;
+  const date_ = new Intl.DateTimeFormat("en-GB", { timeZone: IST, weekday: "short", day: "numeric", month: "short" }).format(date);
+  return `${date_}, ${time}`;
+}
+
+/**
+ * The notification bell's panel. New notifications first; dismissed ones stay
+ * underneath as "Earlier", with their dates, so nothing disappears.
+ */
+export function NotificationList({ notices, run, busy, onOpen, meetingsDone }: { notices: Notice[]; run: Run; busy: string | null; onOpen: (companyId: number) => void; meetingsDone: Set<number> }) {
+  if (notices.length === 0) return <p className="px-2 py-6 text-center text-sm text-ink/60">No notifications yet.</p>;
+  const fresh = notices.filter((n) => !n.read);
+  const old = notices.filter((n) => n.read);
+  const item = (n: Notice) => {
+    const done = n.company_id !== null && meetingsDone.has(n.company_id) && /^Meeting (booked|moved)/.test(n.message);
+    return (
+      <li key={n.id} className={`rounded-2xl px-4 py-3 text-sm ${n.read ? "border border-ink/5 bg-white text-ink/60" : "bg-mist text-ink"}`}>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className={`text-[11px] font-bold uppercase tracking-wider ${n.read ? "text-ink/40" : "text-primary"}`}>{when(n.created_at)}</span>
+          {n.read && <span className="rounded-full bg-ink/5 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-ink/50">Old</span>}
+          {done && <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-emerald-800">Meeting done</span>}
+        </div>
+        <p className="mt-1 break-words">{n.message}</p>
+        <div className="mt-1.5 flex justify-end gap-3">
+          {n.company_id !== null && (
+            <button onClick={() => onOpen(n.company_id!)} className="text-xs font-bold uppercase tracking-wider text-primary hover:underline">
+              Open
+            </button>
+          )}
+          {!n.read && (
+            <button disabled={busy !== null} onClick={() => run("dismissNotification", { id: n.id })} className="text-xs font-bold uppercase tracking-wider text-ink/50 hover:text-ink">
+              Mark as seen
+            </button>
+          )}
+        </div>
+      </li>
+    );
+  };
   return (
-    <ul className="space-y-2">
-      {notices.map((n) => (
-        <li key={n.id} className="rounded-2xl bg-mist px-4 py-3 text-sm">
-          <p className="break-words text-ink">{n.message}</p>
-          <div className="mt-1.5 flex items-center justify-between gap-3">
-            <span className="text-xs text-ink/50">{n.at}</span>
-            <span className="flex shrink-0 gap-3">
-              {n.company_id !== null && (
-                <button onClick={() => onOpen(n.company_id!)} className="text-xs font-bold uppercase tracking-wider text-primary hover:underline">
-                  Open
-                </button>
-              )}
-              <button disabled={busy !== null} onClick={() => run("dismissNotification", { id: n.id })} className="text-xs font-bold uppercase tracking-wider text-ink/50 hover:text-ink">
-                Dismiss
-              </button>
-            </span>
-          </div>
-        </li>
-      ))}
-    </ul>
+    <div className="space-y-4">
+      <div>
+        <p className="mb-2 px-1 text-[11px] font-bold uppercase tracking-widest text-ink/50">New · {fresh.length}</p>
+        {fresh.length ? <ul className="space-y-2">{fresh.map(item)}</ul> : <p className="px-1 text-sm text-ink/50">You are all caught up.</p>}
+      </div>
+      {old.length > 0 && (
+        <div>
+          <p className="mb-2 px-1 text-[11px] font-bold uppercase tracking-widest text-ink/40">Earlier</p>
+          <ul className="space-y-2">{old.map(item)}</ul>
+        </div>
+      )}
+    </div>
   );
 }

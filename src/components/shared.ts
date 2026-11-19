@@ -30,6 +30,8 @@ export type Thread = {
   human_reason: string | null;
   /** The time that matters right now: the meeting time, or the proposed slots. */
   status_detail: string | null;
+  /** The booked meeting's time has passed. */
+  meeting_done: boolean;
   meeting: { when: string; link: string } | null;
   silent_hours: number | null;
   follow_up_sent_at: string | null;
@@ -37,6 +39,6 @@ export type Thread = {
   updated_at: string | null;
 };
 
-export type Notice = { id: number; message: string; at: string; company_id: number | null };
+export type Notice = { id: number; message: string; at: string; created_at: string; read: boolean; company_id: number | null };
 export type CalendarEvent = { id: number; when: string; minutes: number; title: string; link: string | null; thread_id: number | null };
 export type Rules = { followUpAfterHours: number; concludeAfterHours: number; workHours: string; meetingMinutes: number };

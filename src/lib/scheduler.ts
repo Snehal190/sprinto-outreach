@@ -127,15 +127,20 @@ async function checkpoint(thread: Thread, kind: "email_out" | "email_in" | "tool
 }
 
 /** A notice for the human on the dashboard. */
-async function notify(threadId: number, message: string) {
-  await sql(`INSERT INTO notifications (thread_id, message) VALUES ($1,$2)`, [threadId, message]);
+type NoticeKind = "meeting_booked" | "meeting_moved" | "needs_human" | "follow_up" | "info";
+
+async function notify(threadId: number, message: string, kind: NoticeKind) {
+  await sql(
+    `INSERT INTO notifications (thread_id, company_id, kind, message) VALUES ($1, (SELECT company_id FROM threads WHERE id = $1), $2, $3)`,
+    [threadId, kind, message],
+  );
 }
 
 /** Stops the automation for this prospect and asks a human to step in. */
 async function flagHuman(thread: Thread, reason: string, who: string) {
   await sql(`UPDATE threads SET needs_human = TRUE, human_reason = $1, awaiting_reply = FALSE WHERE id = $2`, [reason, thread.id]);
   await checkpoint(thread, "human", `Handed to a human: ${reason}`);
-  await notify(thread.id, `${who} needs you: ${reason}`);
+  await notify(thread.id, `${who} needs you: ${reason}`, "needs_human");
 }
 
 async function context(thread: Thread) {
@@ -241,7 +246,7 @@ async function executeTool(name: string, args: Record<string, unknown>, thread: 
     run.booked = true;
     run.emailedAfterBooking = false;
     await checkpoint(thread, "tool", `book_meeting → ${moved ? "moved to" : "booked"} ${thread.meeting.when}`);
-    await notify(thread.id, `Meeting ${moved ? "moved" : "booked"} with ${ctx.who}: ${thread.meeting.when}. Link: ${thread.meeting.link}`);
+    await notify(thread.id, `Meeting ${moved ? "moved" : "booked"} with ${ctx.who}: ${thread.meeting.when}. Link: ${thread.meeting.link}`, moved ? "meeting_moved" : "meeting_booked");
     return { status: "booked", when: thread.meeting.when, link: thread.meeting.link, minutes: MEETING_MINUTES };
   }
 
@@ -530,13 +535,19 @@ export async function resolveThread(threadId: number) {
 }
 
 export async function dismissNotification(id: number) {
-  await sql(`UPDATE notifications SET read = TRUE WHERE id = $1`, [id]);
+  await sql(`UPDATE notifications SET read = TRUE, read_at = now() WHERE id = $1`, [id]);
+}
+
+/** The booked meeting's end time has passed. */
+function meetingDone(t: Row): boolean {
+  const end = t.meeting?.end ?? t.meeting?.start;
+  return (t.state as State).meeting_status === "confirmed" && !!end && new Date(end).getTime() < Date.now();
 }
 
 function statusLabel(t: Row): string {
   const s = t.state as State;
   if (t.needs_human) return "Needs you";
-  if (s.meeting_status === "confirmed") return "Meeting booked";
+  if (s.meeting_status === "confirmed") return meetingDone(t) ? "Meeting done" : "Meeting booked";
   if (s.reply_status === "not_interested") return "Not interested";
   if (s.meeting_status === "pending_confirmation") return "Waiting for them to confirm a time";
   if (s.reply_status === "interested") return "In conversation";
@@ -556,7 +567,7 @@ export async function schedulingSnapshot() {
   const [threads, events, notifications, calendar] = await Promise.all([
     sql(`SELECT * FROM threads`),
     sql(`SELECT * FROM thread_events ORDER BY id ASC`),
-    sql(`SELECT n.*, t.company_id FROM notifications n LEFT JOIN threads t ON t.id = n.thread_id WHERE n.read = FALSE ORDER BY n.id DESC LIMIT 30`),
+    sql(`SELECT n.*, t.company_id FROM notifications n LEFT JOIN threads t ON t.id = n.thread_id ORDER BY n.id DESC LIMIT 50`),
     upcomingEvents(),
   ]);
   return {
@@ -564,6 +575,7 @@ export async function schedulingSnapshot() {
       ...t,
       status_label: statusLabel(t),
       status_detail: statusDetail(t),
+      meeting_done: meetingDone(t),
       silent_hours: t.awaiting_reply && t.last_outbound_at ? Math.floor((Date.now() - new Date(t.last_outbound_at).getTime()) / 3_600_000) : null,
       // The checkpoints stay in thread_events for the agent and for audits; the dashboard shows only when the latest one happened.
       updated_at: (() => {
@@ -571,7 +583,8 @@ export async function schedulingSnapshot() {
         return last ? formatIst(new Date(last.created_at)) : null;
       })(),
     })),
-    notifications: notifications.map((n): Row => ({ ...n, at: formatIst(new Date(n.created_at)) })),
+    // Dismissed notifications are kept as history: the bell shows them under "Earlier".
+    notifications: notifications.map((n): Row => ({ ...n, at: formatIst(new Date(n.created_at)), created_at: new Date(n.created_at).toISOString() })),
     calendar,
     rules: { followUpAfterHours: FOLLOW_UP_AFTER_HOURS, concludeAfterHours: CONCLUDE_AFTER_HOURS, workHours: `${WORK_START_HOUR}:00 to ${WORK_END_HOUR}:00 IST`, meetingMinutes: MEETING_MINUTES },
   };

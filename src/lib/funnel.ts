@@ -1,5 +1,6 @@
 import { sql, dbMode, type Row } from "./db";
 import { generate, generateJson, geminiModel, parseJson } from "./gemini";
+import { syncTags } from "./tags";
 import { captureLesson, detachLesson, feedbackStats, markSent, retrieveLessons, segmentOf } from "./feedback";
 import { deliver, resendLive, testRecipients } from "./mailer";
 import { googleAccount, googleConfigured } from "./google";
@@ -38,6 +39,7 @@ export async function saveSettings(patch: Partial<Settings>): Promise<Settings> 
 }
 
 export async function getState() {
+  await syncTags();
   const settings = await getSettings();
   const key = icpKey(settings);
   const [profile, companies, contacts, drafts, edits, lessons, feedback, scheduling] = await Promise.all([
@@ -636,7 +638,12 @@ export async function saveDraft(id: number, patch: { subject?: string; body?: st
   const feedback = patch.feedback ?? draft.feedback;
   const textChanged = subject !== draft.subject || body !== draft.body;
 
-  await sql(`UPDATE drafts SET subject = $1, body = $2, feedback = $3, updated_at = now() WHERE id = $4`, [subject, body, feedback, id]);
+  await sql(
+    `UPDATE drafts SET subject = $1, body = $2, feedback = $3, updated_at = now(),
+       feedback_saved_at = CASE WHEN $3 IS DISTINCT FROM feedback THEN (CASE WHEN $3 = '' THEN NULL ELSE now() END) ELSE feedback_saved_at END
+     WHERE id = $4`,
+    [subject, body, feedback, id],
+  );
   if (textChanged) {
     await sql(
       `INSERT INTO draft_edits (draft_id, before_subject, before_body, after_subject, after_body, feedback)
