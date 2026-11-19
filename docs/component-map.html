@@ -1,0 +1,317 @@
+<title>Outreach Components Map</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Manrope:wght@400;500;600;700;800&display=swap">
+<style>
+  /* Layout: a swimlane grid (actors down, funnel stages across) with arrows drawn over it. */
+  :root {
+    --bg: #f4f5f7;
+    --paper: #ffffff;
+    --ink: #1f2429;
+    --muted: #5d6670;
+    --line: #dfe2e6;
+    --head: #2a1416;
+    --head-ink: #ffffff;
+    --accent: #8a0303;
+    --cond: #c2185b;
+    --hand: #7b8590;
+    --lane-user: #f4eded;
+    --lane-app: #f6f3ea;
+    --lane-ai: #f1eef7;
+    --lane-web: #eef4f1;
+    --lane-hunter: #eef2f7;
+    --lane-db: #f2f2f4;
+    --lane-mail: #f5eef1;
+    --box-user: #fbe9e9;   --edge-user: #b85c5c;
+    --box-app: #fff4d6;    --edge-app: #c9a227;
+    --box-ai: #ece6fb;     --edge-ai: #7d63c9;
+    --box-web: #def3e6;    --edge-web: #3f9a63;
+    --box-hunter: #dde9f8; --edge-hunter: #4d7fc0;
+    --box-db: #ebedf0;     --edge-db: #7b8590;
+    --box-mail: #fbe3ec;   --edge-mail: #c2185b;
+    --display: "Instrument Serif", Georgia, "Times New Roman", serif;
+    --body: "Manrope", system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #15181b; --paper: #1d2125; --ink: #eceef0; --muted: #a3abb4; --line: #30363c;
+      --head: #3a1214; --head-ink: #ffffff; --accent: #e0574f; --cond: #f06292; --hand: #8f99a4;
+      --lane-user: #221b1c; --lane-app: #22201a; --lane-ai: #1f1c26; --lane-web: #1a221e; --lane-hunter: #1a1f26; --lane-db: #1f2125; --lane-mail: #241b1f;
+      --box-user: #3a2426; --edge-user: #d98080; --box-app: #3a331c; --edge-app: #d9b84a; --box-ai: #2d2742; --edge-ai: #a993ea;
+      --box-web: #1f3a2a; --edge-web: #6cc28f; --box-hunter: #1f2d42; --edge-hunter: #7ea7dc; --box-db: #2a2e33; --edge-db: #9aa3ad;
+      --box-mail: #3d2230; --edge-mail: #f06292;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #15181b; --paper: #1d2125; --ink: #eceef0; --muted: #a3abb4; --line: #30363c;
+    --head: #3a1214; --head-ink: #ffffff; --accent: #e0574f; --cond: #f06292; --hand: #8f99a4;
+    --lane-user: #221b1c; --lane-app: #22201a; --lane-ai: #1f1c26; --lane-web: #1a221e; --lane-hunter: #1a1f26; --lane-db: #1f2125; --lane-mail: #241b1f;
+    --box-user: #3a2426; --edge-user: #d98080; --box-app: #3a331c; --edge-app: #d9b84a; --box-ai: #2d2742; --edge-ai: #a993ea;
+    --box-web: #1f3a2a; --edge-web: #6cc28f; --box-hunter: #1f2d42; --edge-hunter: #7ea7dc; --box-db: #2a2e33; --edge-db: #9aa3ad;
+    --box-mail: #3d2230; --edge-mail: #f06292;
+    color-scheme: dark;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--body);
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 32px 48px;
+  }
+  .wrap { max-width: 1280px; margin: 0 auto; display: grid; gap: 20px; }
+  header { display: grid; gap: 6px; }
+  .eyebrow { font-size: 11px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); }
+  h1 { font-family: var(--display); font-weight: 400; font-size: clamp(34px, 5vw, 52px); line-height: 1; margin: 0; text-wrap: balance; }
+  h1 em { color: var(--accent); }
+  .lede { margin: 4px 0 0; max-width: 70ch; color: var(--muted); line-height: 1.55; font-size: 14px; }
+
+  .board { background: var(--paper); border: 1px solid var(--line); border-radius: 22px; padding: 14px; }
+  .scroll { overflow-x: auto; }
+  .map { position: relative; min-width: 1180px; }
+  .grid {
+    display: grid;
+    grid-template-columns: 150px repeat(6, minmax(0, 1fr));
+    grid-auto-rows: auto;
+    gap: 4px;
+  }
+  .colhead, .actor {
+    background: var(--head); color: var(--head-ink);
+    border-radius: 8px; display: flex; align-items: center; justify-content: center; text-align: center;
+  }
+  .colhead { padding: 12px 6px; font-weight: 800; font-size: 13px; }
+  .actor { flex-direction: column; padding: 10px 8px; gap: 2px; }
+  .actor b { font-size: 14px; }
+  .actor span { font-size: 11px; opacity: .75; line-height: 1.3; }
+  .cell { min-height: 112px; border-radius: 6px; display: flex; align-items: center; justify-content: center; padding: 14px 12px; }
+  .lane-user .cell { background: var(--lane-user); }
+  .lane-app .cell { background: var(--lane-app); }
+  .lane-ai .cell { background: var(--lane-ai); }
+  .lane-web .cell { background: var(--lane-web); }
+  .lane-hunter .cell { background: var(--lane-hunter); }
+  .lane-db .cell { background: var(--lane-db); }
+  .lane-mail .cell { background: var(--lane-mail); }
+  .lane { display: contents; }
+
+  .box {
+    position: relative; z-index: 2;
+    width: 100%; max-width: 200px;
+    border-radius: 10px; border: 1.5px solid; padding: 9px 10px;
+    font-size: 12px; line-height: 1.38; text-align: center;
+  }
+  .box strong { display: block; font-size: 12.5px; margin-bottom: 2px; }
+  .box small { display: block; color: var(--muted); font-size: 11px; margin-top: 3px; }
+  .box.note { border-style: dashed; }
+  .b-user { background: var(--box-user); border-color: var(--edge-user); }
+  .b-app { background: var(--box-app); border-color: var(--edge-app); }
+  .b-ai { background: var(--box-ai); border-color: var(--edge-ai); }
+  .b-web { background: var(--box-web); border-color: var(--edge-web); }
+  .b-hunter { background: var(--box-hunter); border-color: var(--edge-hunter); }
+  .b-db { background: var(--box-db); border-color: var(--edge-db); }
+  .b-mail { background: var(--box-mail); border-color: var(--edge-mail); }
+  .box ul { margin: 4px 0 0; padding-left: 14px; text-align: left; }
+
+  svg.arrows { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 3; overflow: visible; }
+  .path-main { stroke: var(--ink); stroke-width: 1.6; fill: none; }
+  .path-cond { stroke: var(--cond); stroke-width: 1.6; fill: none; stroke-dasharray: 6 4; }
+  .path-hand { stroke: var(--hand); stroke-width: 1.6; fill: none; stroke-dasharray: 6 4; }
+  .elabel { font: 700 10.5px var(--body); paint-order: stroke; stroke: var(--paper); stroke-width: 4px; }
+  .elabel.cond { fill: var(--cond); }
+  .elabel.main { fill: var(--ink); }
+  .elabel.hand { fill: var(--hand); }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 10px 26px; align-items: center; padding: 12px 16px; background: var(--bg); border-radius: 12px; font-size: 12px; color: var(--muted); }
+  .legend b { color: var(--ink); }
+  .legend svg { vertical-align: middle; margin-right: 6px; }
+
+  .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  .step { background: var(--paper); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; align-items: baseline; min-width: 0; }
+  .step .n { font-family: var(--display); font-size: 30px; line-height: 1; color: var(--accent); grid-row: span 2; font-variant-numeric: tabular-nums; }
+  .step h3 { margin: 0; font-size: 14px; }
+  .step p { margin: 0; font-size: 13px; line-height: 1.5; color: var(--muted); }
+  .scope { font-size: 13px; color: var(--muted); }
+  .scope b { color: var(--ink); }
+  h2 { font-family: var(--display); font-weight: 400; font-size: 30px; margin: 8px 0 0; }
+</style>
+
+<div class="wrap">
+  <header>
+    <span class="eyebrow">Build 2 · Outreach</span>
+    <h1>Components <em>map</em></h1>
+    <p class="lede">Who does what, from the ICP to a sent email. Each row is a part of the system, each column a stage of the funnel. The after-send flow (replies, scheduling, follow-ups) is left out of this map.</p>
+  </header>
+
+  <div class="board">
+    <div class="scroll">
+      <div class="map" id="map">
+        <div class="grid">
+          <div class="colhead">Actor</div>
+          <div class="colhead">Trigger</div>
+          <div class="colhead">Input</div>
+          <div class="colhead">Context</div>
+          <div class="colhead">Processing</div>
+          <div class="colhead">AI</div>
+          <div class="colhead">Output</div>
+
+          <!-- Growth lead -->
+          <div class="lane lane-user">
+            <div class="actor"><b>Growth Lead</b><span>(User)</span></div>
+            <div class="cell"><div class="box b-user" id="u1"><strong>Sets the ICP</strong>Enters the ICP and what we sell (Sprinto by default), then presses Find companies, or pastes a list of websites</div></div>
+            <div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div>
+            <div class="cell"><div class="box b-user" id="u2"><strong>Reviews before sending</strong>Gets a ready-to-send email with its fit score and reason; edits it, adds feedback, presses Send</div></div>
+          </div>
+
+          <!-- System -->
+          <div class="lane lane-app">
+            <div class="actor"><b>System</b><span>(Outreach app on Vercel)</span></div>
+            <div class="cell"></div>
+            <div class="cell"><div class="box b-app" id="s1"><strong>ICP profile</strong>Fit questions, scoring rubric, roles to target and keywords for this ICP</div></div>
+            <div class="cell"></div>
+            <div class="cell"><div class="box b-app note" id="s2"><strong>API check first</strong>A free test call to Gemini, Hunter or email before each paid call; a broken key stops the step early</div></div>
+            <div class="cell"></div>
+            <div class="cell"><div class="box b-app" id="s3"><strong>Dashboard</strong>Funnel and Qualified tabs: score, contact, draft and stage for each company</div></div>
+          </div>
+
+          <!-- Gemini -->
+          <div class="lane lane-ai">
+            <div class="actor"><b>Gemini</b><span>(AI model + Google Search)</span></div>
+            <div class="cell"></div>
+            <div class="cell"><div class="box b-ai" id="g1"><strong>Writes the profile</strong>Turns a new ICP into fit questions and a rubric (once, then cached)</div></div>
+            <div class="cell"><div class="box b-ai" id="g2"><strong>Finds companies</strong>Live Google Search for matches: what they do, stage, size, intent signals</div></div>
+            <div class="cell"><div class="box b-ai" id="g3"><strong>Scores fit, 0–100</strong>Against the rubric. 70+ is qualified; failing a must-have scores 10</div></div>
+            <div class="cell"><div class="box b-ai" id="g4"><strong>Researches and drafts</strong>Verifies facts about the person, picks 2 pain points, writes the email with a hook and the lead angle (e.g. SOC 2)</div></div>
+            <div class="cell"></div>
+          </div>
+
+          <!-- Website -->
+          <div class="lane lane-web">
+            <div class="actor"><b>Company website</b><span>(Scraper)</span></div>
+            <div class="cell"></div><div class="cell"></div>
+            <div class="cell"><div class="box b-web" id="w1"><strong>Reads the website</strong>Homepage, then pricing, careers, security, about or news, only while a fit question is still open</div></div>
+            <div class="cell"></div><div class="cell"></div><div class="cell"></div>
+          </div>
+
+          <!-- Hunter -->
+          <div class="lane lane-hunter">
+            <div class="actor"><b>Hunter.io</b><span>(Find company contacts)</span></div>
+            <div class="cell"></div><div class="cell"></div><div class="cell"></div>
+            <div class="cell"><div class="box b-hunter" id="h1"><strong>Finds the right contact</strong>Name, title and email of the person the ICP targets; the website's team page if Hunter has no one</div></div>
+            <div class="cell"></div><div class="cell"></div>
+          </div>
+
+          <!-- Database -->
+          <div class="lane lane-db">
+            <div class="actor"><b>Neon Postgres</b><span>(Database)</span></div>
+            <div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div>
+            <div class="cell"><div class="box b-db" id="d2"><strong>Lessons</strong>What the human changed in past drafts and their feedback notes, per ICP</div></div>
+            <div class="cell"><div class="box b-db" id="d1"><strong>Campaign record</strong>Company (per ICP), score, contact, draft, stage, all tagged in columns</div></div>
+          </div>
+
+          <!-- Email -->
+          <div class="lane lane-mail">
+            <div class="actor"><b>Gmail / Resend</b><span>(Email)</span></div>
+            <div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div>
+            <div class="cell"><div class="box b-mail" id="e1"><strong>Email delivered</strong>Sent from Gmail (Resend as fallback); only to the test addresses while sends are locked</div></div>
+          </div>
+        </div>
+        <svg class="arrows" id="arrows" aria-hidden="true"></svg>
+      </div>
+    </div>
+  </div>
+
+  <div class="legend" role="note">
+    <b>Flow legend</b>
+    <span><svg width="40" height="10" aria-hidden="true"><line x1="0" y1="5" x2="32" y2="5" class="path-main"/><path d="M32 1 L40 5 L32 9 Z" fill="currentColor" style="color:var(--ink)"/></svg>Main flow, step by step</span>
+    <span><svg width="40" height="10" aria-hidden="true"><line x1="0" y1="5" x2="32" y2="5" class="path-cond"/><path d="M32 1 L40 5 L32 9 Z" style="fill:var(--cond)"/></svg>Only when needed</span>
+    <span><svg width="40" height="10" aria-hidden="true"><line x1="0" y1="5" x2="32" y2="5" class="path-hand"/><path d="M32 1 L40 5 L32 9 Z" style="fill:var(--hand)"/></svg>Hand-off to an output</span>
+  </div>
+
+  <h2>The flow, step by step</h2>
+  <div class="steps">
+    <div class="step"><span class="n">1</span><h3>Set the ICP</h3><p>The Growth Lead keeps the Sprinto ICP or enters another one. A new ICP gets its own profile, written once by Gemini.</p></div>
+    <div class="step"><span class="n">2</span><h3>Find companies</h3><p>Gemini searches the web live for companies that match, with intent signals such as a recent round or compliance hiring.</p></div>
+    <div class="step"><span class="n">3</span><h3>Score the fit</h3><p>Each company is scored out of 100 against the rubric. 70 or more is qualified and appears in the Qualified tab.</p></div>
+    <div class="step"><span class="n">4</span><h3>Fill the gaps</h3><p>If a fit question is still open, the scraper reads more of the company's website and the score is redone.</p></div>
+    <div class="step"><span class="n">5</span><h3>Find the contact</h3><p>Hunter.io returns the people at the company; the one whose role matches the ICP is picked.</p></div>
+    <div class="step"><span class="n">6</span><h3>Draft the email</h3><p>Gemini researches the person, picks two pain points and writes the email, using lessons from earlier edits.</p></div>
+    <div class="step"><span class="n">7</span><h3>Review and send</h3><p>The Growth Lead edits and sends. Their changes and feedback become lessons for the next drafts.</p></div>
+    <div class="step"><span class="n">8</span><h3>Record it</h3><p>Every step is saved in Neon with the company's stage, so the dashboard and the database agree.</p></div>
+  </div>
+  <p class="scope"><b>Not in this map:</b> what happens after the send (reading replies, proposing times, booking the call, follow-ups). That flow comes next.</p>
+</div>
+
+<script>
+  // Arrows are drawn from the boxes' real positions, so they stay attached at any width.
+  // route: "h" straight across, "v" straight up/down, "hv" across then up/down,
+  // "vh" up/down then across, "x" across to a lane gap at `mid`, then up/down, then across.
+  const EDGES = [
+    { from: "u1", to: "s1", kind: "main", route: "hv" },
+    { from: "s1", to: "g1", kind: "cond", route: "v", label: "new ICP only", lx: 6 },
+    { from: "s1", to: "g2", kind: "main", route: "hv" },
+    { from: "g2", to: "g3", kind: "main", route: "h" },
+    { from: "g3", to: "w1", kind: "cond", route: "vh", sx: 0.3, label: "if details are missing: read more, re-score", lx: -6, la: "end" },
+    { from: "g3", to: "h1", kind: "main", route: "v", sx: 0.72, tx: 0.72, label: "qualified", lx: 6 },
+    { from: "h1", to: "g4", kind: "main", route: "hv", tx: 0.3 },
+    { from: "d2", to: "g4", kind: "cond", route: "v", sx: 0.72, tx: 0.72, label: "past lessons", lx: 6 },
+    { from: "g4", to: "u2", kind: "hand", route: "x", mid: -14 },
+    { from: "g4", to: "d1", kind: "hand", route: "x", mid: 0 },
+    { from: "g4", to: "s3", kind: "hand", route: "x", mid: -7 },
+    { from: "u2", to: "d2", kind: "cond", route: "x", mid: 9, label: "edits + feedback become lessons", la: "start", lx: 8 },
+    { from: "u2", to: "e1", kind: "main", route: "x", mid: "right", label: "Send" },
+  ];
+
+  function draw() {
+    const map = document.getElementById("map");
+    const svg = document.getElementById("arrows");
+    const base = map.getBoundingClientRect();
+    const r = (id) => {
+      const b = document.getElementById(id).getBoundingClientRect();
+      return { l: b.left - base.left, r: b.right - base.left, t: b.top - base.top, b: b.bottom - base.top, cx: (b.left + b.right) / 2 - base.left, cy: (b.top + b.bottom) / 2 - base.top, w: b.width, h: b.height };
+    };
+    // The gap between the AI and Output columns: where hand-offs travel.
+    const outCell = document.getElementById("u2").parentElement.getBoundingClientRect();
+    const gapX = outCell.left - base.left - 2;
+    const rightX = outCell.right - base.left - 6;
+
+    let out = `<defs>${["main", "cond", "hand"].map((k) => `<marker id="m-${k}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" style="fill:var(--${k === "main" ? "ink" : k === "cond" ? "cond" : "hand"})"/></marker>`).join("")}</defs>`;
+    for (const e of EDGES) {
+      const a = r(e.from), b = r(e.to);
+      let d, lp;
+      const sx = a.l + a.w * (e.sx ?? 0.5), tx = b.l + b.w * (e.tx ?? 0.5);
+      if (e.route === "h") {
+        d = `M${a.r} ${a.cy} H${b.l}`;
+      } else if (e.route === "v") {
+        const down = b.cy > a.cy;
+        const y1 = down ? a.b : a.t, y2 = down ? b.t : b.b;
+        d = `M${sx} ${y1} V${y2}`;
+        lp = [sx, (y1 + y2) / 2];
+      } else if (e.route === "hv") {
+        const down = b.cy > a.cy;
+        d = `M${a.r} ${a.cy} H${tx} V${down ? b.t : b.b}`;
+      } else if (e.route === "vh") {
+        const left = b.cx < a.cx;
+        d = `M${sx} ${a.b} V${b.cy} H${left ? b.r : b.l}`;
+        lp = [sx, (a.b + b.cy) / 2];
+      } else if (e.route === "x") {
+        const mx = e.mid === "right" ? rightX : gapX + e.mid;
+        const sxp = mx > a.cx ? a.r : a.l;
+        const txp = mx > b.cx ? b.r : b.l;
+        d = `M${sxp} ${a.cy} H${mx} V${b.cy} H${txp}`;
+        lp = [mx, (a.cy + b.cy) / 2];
+      }
+      out += `<path d="${d}" class="path-${e.kind}" marker-end="url(#m-${e.kind})"/>`;
+      if (e.label && lp) {
+        const anchor = e.la ?? (e.lside === "right" || e.mid === "right" ? "end" : "start");
+        const dx = e.lx ?? (anchor === "end" ? -6 : 6);
+        out += `<text class="elabel ${e.kind}" x="${lp[0] + dx}" y="${lp[1]}" text-anchor="${anchor}" dominant-baseline="middle">${e.label}</text>`;
+      }
+    }
+    svg.innerHTML = out;
+  }
+  draw();
+  window.addEventListener("resize", draw);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(draw);
+</script>
