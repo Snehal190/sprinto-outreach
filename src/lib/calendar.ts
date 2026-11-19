@@ -39,8 +39,8 @@ export type Availability = { status: "free" | "busy" | "no-calendar-access"; rea
 
 /**
  * Is this exact date and time free for a meeting? Besides clashes with other
- * events, a slot counts as busy when it is in the past, outside 09:00-18:00
- * IST, or more than 30 days out. `ignoreThreadId` leaves out that prospect's
+ * events, a slot counts as busy when it is in the past, on a Saturday or
+ * Sunday, outside 09:00-18:00 IST, or more than 30 days out. `ignoreThreadId` leaves out that prospect's
  * own existing booking, so a meeting can be moved to an overlapping time.
  */
 export async function checkCalendar(dateText: string, ignoreThreadId?: number, minutes = MEETING_MINUTES, ignoreGoogleEventId?: string): Promise<Availability> {
@@ -52,6 +52,10 @@ export async function checkCalendar(dateText: string, ignoreThreadId?: number, m
   if (start.getTime() - now > MAX_DAYS_AHEAD * 86_400_000) return { status: "busy", reason: `more than ${MAX_DAYS_AHEAD} days out, not bookable yet` };
 
   const ist = new Date(start.getTime() + IST_OFFSET_MS);
+  // Guardrail: no meetings on Saturday or Sunday (IST).
+  if (ist.getUTCDay() === 0 || ist.getUTCDay() === 6) {
+    return { status: "busy", reason: "that is a weekend; meetings are Monday to Friday only" };
+  }
   const startMinutes = ist.getUTCHours() * 60 + ist.getUTCMinutes();
   if (startMinutes < WORK_START_HOUR * 60 || startMinutes + minutes > WORK_END_HOUR * 60) {
     return { status: "busy", reason: `outside meeting hours (${WORK_START_HOUR}:00 to ${WORK_END_HOUR}:00 IST)` };
