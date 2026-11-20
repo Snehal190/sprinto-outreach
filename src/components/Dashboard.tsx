@@ -179,10 +179,6 @@ export default function Dashboard() {
             : `Reply handled (${String(data.result.intent).replace("_", " ")})${data.result.booked ? ". Meeting booked and the link sent." : "."}`,
         );
       }
-      if (action === "testApis") {
-        const broken = (data.result as ApiStatus[]).filter((a) => !a.ok && !a.off);
-        setNotice(broken.length ? `API test failed: ${broken.map((a) => `${a.label}: ${a.detail}`).join(" · ")}` : "API test: everything that is set up is working.");
-      }
       if (action === "checkInbox") {
         setNotice(data.result.handled ? `Handled ${data.result.handled} new repl${data.result.handled === 1 ? "y" : "ies"} from the inbox.` : "No new replies in the inbox.");
       }
@@ -281,13 +277,6 @@ export default function Dashboard() {
               <Pill ok={false} text="Google not set up" />
             )}
             <Pill ok text={config.model} />
-            <button
-              disabled={busy !== null}
-              onClick={() => run("testApis", {}, "testApis")}
-              className="rounded-full border border-primary/30 px-3 py-1 text-[11px] font-bold uppercase tracking-wider text-primary hover:border-primary disabled:opacity-50"
-            >
-              {busy === "testApis" ? "Testing…" : "Test APIs"}
-            </button>
             <div className="relative">
               <button
                 aria-label={`Notifications (${unread} new)`}
