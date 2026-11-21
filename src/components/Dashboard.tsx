@@ -375,7 +375,7 @@ export default function Dashboard() {
               [
                 ["funnel", "Funnel"],
                 ["qualified", `Qualified · ${qualified.length}`],
-                ["evals", state.lastEval ? `Evals · ${state.lastEval.passed ? "passed" : "failed"}` : "Evals"],
+                ["evals", "Evals"],
               ] as const
             ).map(([key, name]) => (
               <button
