@@ -197,6 +197,65 @@ const SCHEMA = [
   `ALTER TABLE notifications ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ`,
   `ALTER TABLE drafts ADD COLUMN IF NOT EXISTS edited BOOLEAN NOT NULL DEFAULT FALSE`,
   `ALTER TABLE drafts ADD COLUMN IF NOT EXISTS feedback_saved_at TIMESTAMPTZ`,
+  `ALTER TABLE companies ADD COLUMN IF NOT EXISTS status_manual BOOLEAN NOT NULL DEFAULT FALSE`,
+  // Evals (src/lib/evals). Every press of Send, with its outcome, so a send can never fail silently or go out twice.
+  `CREATE TABLE IF NOT EXISTS send_log (
+     id SERIAL PRIMARY KEY,
+     draft_id INT REFERENCES drafts(id) ON DELETE CASCADE,
+     company_id INT REFERENCES companies(id) ON DELETE CASCADE,
+     ok BOOLEAN NOT NULL,
+     mode TEXT,
+     recipients JSONB NOT NULL DEFAULT '[]',
+     error TEXT,
+     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+   )`,
+  // Every paid Hunter.io request, so credits per company can be checked.
+  `CREATE TABLE IF NOT EXISTS hunter_usage (
+     id SERIAL PRIMARY KEY,
+     company_id INT REFERENCES companies(id) ON DELETE CASCADE,
+     domain TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     credits INT NOT NULL,
+     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+   )`,
+  // One row per eval run, and one per case result. Step checks (run after each
+  // funnel step) are stored with run_id NULL and replace the company's earlier ones.
+  `CREATE TABLE IF NOT EXISTS eval_runs (
+     id SERIAL PRIMARY KEY,
+     icp_key TEXT NOT NULL,
+     trigger TEXT NOT NULL,
+     options JSONB NOT NULL DEFAULT '{}',
+     status TEXT NOT NULL DEFAULT 'running',
+     passed BOOLEAN,
+     summary JSONB,
+     error TEXT,
+     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+     finished_at TIMESTAMPTZ
+   )`,
+  `CREATE TABLE IF NOT EXISTS eval_results (
+     id SERIAL PRIMARY KEY,
+     run_id INT REFERENCES eval_runs(id) ON DELETE CASCADE,
+     case_id TEXT NOT NULL,
+     stage TEXT NOT NULL,
+     severity TEXT NOT NULL,
+     company_id INT REFERENCES companies(id) ON DELETE CASCADE,
+     subject TEXT,
+     passed BOOLEAN NOT NULL,
+     detail TEXT,
+     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+   )`,
+  `CREATE INDEX IF NOT EXISTS eval_results_run ON eval_results (run_id)`,
+  // How long each dashboard step took and whether it worked (eval SYS-04).
+  `CREATE TABLE IF NOT EXISTS step_log (
+     id SERIAL PRIMARY KEY,
+     action TEXT NOT NULL,
+     company_id INT,
+     ms INT NOT NULL,
+     ok BOOLEAN NOT NULL,
+     error TEXT,
+     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+   )`,
+  `CREATE INDEX IF NOT EXISTS eval_results_company ON eval_results (company_id) WHERE run_id IS NULL`,
 ];
 
 async function connect(): Promise<Query> {

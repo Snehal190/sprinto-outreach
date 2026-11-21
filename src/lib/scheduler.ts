@@ -4,7 +4,8 @@ import { deliver, testRecipients } from "./mailer";
 import { calendarCancel, gmailReplies, googleAccount, type GmailSent } from "./google";
 import { mailApi, requireApis } from "./health";
 import { getSettings } from "./icp";
-import { MEETING_MINUTES, WORK_END_HOUR, WORK_START_HOUR, bookMeeting, checkCalendar, formatIst, parseIst, toIstInput, upcomingEvents, type Meeting } from "./calendar";
+import { MEETING_MINUTES, WORK_END_HOUR, WORK_START_HOUR, bookMeeting, checkCalendar, formatIst, parseIst, slotRule, toIstInput, upcomingEvents, type Availability, type Meeting } from "./calendar";
+import { guard, onlyMeetingLink, timeFormatOk, wordCount } from "./evals/checks";
 
 // What happens after the outreach email is sent.
 //
@@ -154,6 +155,8 @@ async function context(thread: Thread) {
 /** Sends an email in the thread, through the recipient lock, and logs it. Returns null on success or the error text. */
 async function sendInThread(thread: Thread, body: string, label: string, prospectEmail: string | null): Promise<string | null> {
   try {
+    // Kill guard (eval SCH-10): the only link a scheduling email may carry is the booked meeting link.
+    guard("SCH-10", onlyMeetingLink(body, thread.meeting?.link));
     const result = await deliver({ subject: thread.subject, body, prospectEmail, gmailThreadId: thread.gmail_thread_id, inReplyTo: thread.gmail_last_message_id });
     if (result.gmail) {
       thread.gmail_thread_id = result.gmail.threadId;
@@ -196,8 +199,35 @@ async function attendees(prospectEmail: string | null): Promise<string[]> {
 // ---------------------------------------------------------------- the loop
 
 type Run = { checked: Map<string, string>; emails: number; calls: number; booked: boolean; emailedAfterBooking: boolean };
+type Ctx = Awaited<ReturnType<typeof context>>;
 
-async function executeTool(name: string, args: Record<string, unknown>, thread: Thread, run: Run, ctx: Awaited<ReturnType<typeof context>>): Promise<Record<string, unknown>> {
+/**
+ * Everything the tools touch outside the conversation. The real one uses the
+ * calendar, the mailer and the database; the eval sandbox swaps in a fake
+ * calendar and records emails instead of sending them.
+ */
+type IO = {
+  check: (key: string, thread: Thread) => Promise<Availability>;
+  book: (thread: Thread, key: string, ctx: Ctx) => Promise<Meeting>;
+  send: (thread: Thread, body: string, label: string, prospectEmail: string | null) => Promise<string | null>;
+  checkpoint: (thread: Thread, kind: "email_out" | "email_in" | "tool" | "branch" | "human", summary: string, body?: string | null) => Promise<void>;
+  notify: (threadId: number, message: string, kind: NoticeKind) => Promise<void>;
+  /** Eval sandbox only: what the tools did. */
+  record?: { proposals: string[][]; bookings: string[]; blocked: string[] };
+};
+
+const REAL_IO: IO = {
+  check: (key, thread) => checkCalendar(key, thread.id, MEETING_MINUTES, thread.meeting?.googleEventId),
+  book: async (thread, key, ctx) =>
+    bookMeeting(thread.id, key, `${ctx.seller} x ${ctx.company.name ?? "prospect"}`, {
+      attendees: await attendees(ctx.contact.email ?? null), previousEventId: thread.meeting?.googleEventId,
+    }),
+  send: sendInThread,
+  checkpoint,
+  notify,
+};
+
+async function executeTool(name: string, args: Record<string, unknown>, thread: Thread, run: Run, ctx: Ctx, io: IO = REAL_IO): Promise<Record<string, unknown>> {
   run.calls++;
   const slotKey = (text: unknown) => {
     const date = parseIst(String(text ?? ""));
@@ -206,10 +236,10 @@ async function executeTool(name: string, args: Record<string, unknown>, thread: 
 
   if (name === "check_calendar") {
     const key = slotKey(args.date);
-    const result = await checkCalendar(String(args.date ?? ""), thread.id, MEETING_MINUTES, thread.meeting?.googleEventId);
+    const result: Availability = key ? await io.check(key, thread) : { status: "busy", reason: "the date could not be read; use YYYY-MM-DDTHH:MM in IST" };
     if (key) run.checked.set(key, result.status);
     thread.state.calendar_checked = true;
-    await checkpoint(thread, "tool", `check_calendar(${key ? formatIst(parseIst(key)!) : args.date}) → ${result.status}${result.reason ? `: ${result.reason}` : ""}`);
+    await io.checkpoint(thread, "tool", `check_calendar(${key ? formatIst(parseIst(key)!) : args.date}) → ${result.status}${result.reason ? `: ${result.reason}` : ""}`);
     return result;
   }
 
@@ -221,32 +251,41 @@ async function executeTool(name: string, args: Record<string, unknown>, thread: 
     }
     if (run.emails >= MAX_EMAILS_PER_RUN) return { status: "rejected", reason: "email limit for this turn reached" };
     const slots = keys.map((k) => formatIst(parseIst(k)!));
-    const body = `${String(args.message ?? "").trim()}\n\n${slots.map((s) => `- ${s}`).join("\n")}\n\nJust reply with the one that works, or suggest another time.\n\n${ctx.sender}`;
+    const opening = String(args.message ?? "").trim();
+    if (timeFormatOk(opening)) return { status: "rejected", reason: `The slots are listed for you; leave times out of the opening, or write them like "Tue 17 Nov, 3:15 PM IST".` };
+    const body = `${opening}\n\n${slots.map((s) => `- ${s}`).join("\n")}\n\nJust reply with the one that works, or suggest another time.\n\n${ctx.sender}`;
     thread.state.times_proposed = slots;
     thread.state.meeting_status = "pending_confirmation";
     run.emails++;
-    const error = await sendInThread(thread, body, `propose_times → ${slots.length} slots proposed`, ctx.contact.email ?? null);
+    io.record?.proposals.push(keys);
+    const error = await io.send(thread, body, `propose_times → ${slots.length} slots proposed`, ctx.contact.email ?? null);
     return error ? { status: "rejected", reason: error } : { status: "sent", slots };
   }
 
   if (name === "book_meeting") {
     const key = slotKey(args.date);
+    // Kill guard (evals SCH-02, SCH-03): weekends, out-of-hours and past slots are never booked, whatever the model asks.
+    const broken = key ? slotRule(parseIst(key)!) : null;
+    if (key && broken) {
+      io.record?.blocked.push(key);
+      return { status: "rejected", reason: broken };
+    }
+    // Kill guard (eval SCH-04): only a slot check_calendar returned free for in this turn.
     if (!key || run.checked.get(key) !== "free") return { status: "rejected", reason: "Call check_calendar for this exact date and time first; it must come back free." };
     // Checked again at the moment of booking, in case the calendar changed.
-    const again = await checkCalendar(key, thread.id, MEETING_MINUTES, thread.meeting?.googleEventId);
+    const again = await io.check(key, thread);
     if (again.status !== "free") return { status: "rejected", reason: `no longer free: ${again.reason ?? again.status}` };
     const moved = !!thread.meeting;
-    thread.meeting = await bookMeeting(thread.id, key, `${ctx.seller} x ${ctx.company.name ?? "prospect"}`, {
-      attendees: await attendees(ctx.contact.email ?? null), previousEventId: thread.meeting?.googleEventId,
-    });
+    thread.meeting = await io.book(thread, key, ctx);
+    io.record?.bookings.push(key);
     thread.state.meeting_status = "confirmed";
     // The agreed time replaces the earlier proposals, so a moved meeting shows its new time.
     thread.state.times_proposed = [thread.meeting.when];
     thread.state.calendar_checked = true;
     run.booked = true;
     run.emailedAfterBooking = false;
-    await checkpoint(thread, "tool", `book_meeting → ${moved ? "moved to" : "booked"} ${thread.meeting.when}`);
-    await notify(thread.id, `Meeting ${moved ? "moved" : "booked"} with ${ctx.who}: ${thread.meeting.when}. Link: ${thread.meeting.link}`, moved ? "meeting_moved" : "meeting_booked");
+    await io.checkpoint(thread, "tool", `book_meeting → ${moved ? "moved to" : "booked"} ${thread.meeting.when}`);
+    await io.notify(thread.id, `Meeting ${moved ? "moved" : "booked"} with ${ctx.who}: ${thread.meeting.when}. Link: ${thread.meeting.link}`, moved ? "meeting_moved" : "meeting_booked");
     return { status: "booked", when: thread.meeting.when, link: thread.meeting.link, minutes: MEETING_MINUTES };
   }
 
@@ -254,12 +293,15 @@ async function executeTool(name: string, args: Record<string, unknown>, thread: 
     const body = String(args.body ?? "").trim();
     if (!body) return { status: "rejected", reason: "empty email" };
     if (run.emails >= MAX_EMAILS_PER_RUN) return { status: "rejected", reason: "email limit for this turn reached" };
-    const links = body.match(/https?:\/\/\S+/g) ?? [];
-    if (links.some((l) => !thread.meeting || !l.startsWith(thread.meeting.link))) {
+    if (onlyMeetingLink(body, thread.meeting?.link)) {
       return { status: "rejected", reason: "The only link allowed is the meeting link returned by book_meeting." };
     }
+    // Eval SCH-11: times are unambiguous ("Tue 17 Nov, 3:15 PM IST") and the email is short. Rejected here so the model rewrites it.
+    const badTime = timeFormatOk(body);
+    if (badTime) return { status: "rejected", reason: `Write every time with minutes and the time zone, like "Tue 17 Nov, 3:15 PM IST" (${badTime}). Rewrite and send again.` };
+    if (wordCount(body) >= 80) return { status: "rejected", reason: `The email is ${wordCount(body)} words; keep it under 80. Rewrite and send again.` };
     run.emails++;
-    const error = await sendInThread(thread, body, "send_email", ctx.contact.email ?? null);
+    const error = await io.send(thread, body, "send_email", ctx.contact.email ?? null);
     if (!error && run.booked && thread.meeting && body.includes(thread.meeting.link)) run.emailedAfterBooking = true;
     return error ? { status: "rejected", reason: error } : { status: "sent" };
   }
@@ -276,7 +318,7 @@ async function conversationText(threadId: number): Promise<string> {
 }
 
 /** Runs the model-decides / code-acts loop for one trigger. Ends when the model stops calling tools or at MAX_AGENT_STEPS. */
-async function runAgent(thread: Thread, ctx: Awaited<ReturnType<typeof context>>, trigger: string, toolNames: string[]): Promise<Run> {
+async function runAgent(thread: Thread, ctx: Ctx, trigger: string, toolNames: string[], io: IO = REAL_IO): Promise<Run> {
   const run: Run = { checked: new Map(), emails: 0, calls: 0, booked: false, emailedAfterBooking: false };
   const now = new Date();
   const system = `You are the scheduling assistant for ${ctx.sender} at ${ctx.seller}, handling the email thread with ${ctx.who}, ${ctx.contact.title ?? "a prospect"}.
@@ -315,7 +357,7 @@ Rules:
     const results: Part[] = [];
     for (const part of calls) {
       const call = part.functionCall!;
-      const response = toolNames.includes(call.name) ? await executeTool(call.name, call.args ?? {}, thread, run, ctx) : { status: "rejected", reason: "tool not available now" };
+      const response = toolNames.includes(call.name) ? await executeTool(call.name, call.args ?? {}, thread, run, ctx, io) : { status: "rejected", reason: "tool not available now" };
       results.push({ functionResponse: { name: call.name, response, ...(call.id ? { id: call.id } : {}) } });
     }
     contents.push({ role: "user", parts: results });
@@ -326,6 +368,53 @@ Rules:
 // ------------------------------------------------------------ inbound reply
 
 type Intent = "interested" | "not_interested" | "confirms_time" | "counter_proposal" | "reschedule" | "other";
+
+/** The branch: what kind of reply is this? One model call, no tools. Shared by real replies and the eval sandbox. */
+async function classifyReply(state: State, meetingWhen: string | null, history: string, reply: string): Promise<{ intent: Intent; reason: string }> {
+  const { data } = await generateJson<{ intent: Intent; reason: string }>(
+    `Classify the prospect's latest reply in a sales email thread about booking a call.
+
+State: ${JSON.stringify(state)}
+Meeting currently booked: ${meetingWhen ?? "none"}
+Slots we last proposed: ${state.times_proposed.join("; ") || "none"}
+
+Thread so far:
+${history}
+
+Latest reply from the prospect:
+"""${reply}"""
+
+Choose one intent:
+- "interested": wants to talk, but names no specific time.
+- "confirms_time": accepts one of the slots we proposed.
+- "counter_proposal": no meeting is booked yet and they name a different time of their own.
+- "reschedule": a meeting is already booked and they ask to move it, even by a few minutes.
+- "not_interested": declines, asks to stop, or says it is not relevant.
+- "other": anything else - a question, an out-of-office, a referral to a colleague, unclear.
+
+Return JSON: {"intent": string, "reason": one short sentence}`,
+    { temperature: 0, fast: true },
+  );
+  const intent: Intent = ["interested", "not_interested", "confirms_time", "counter_proposal", "reschedule", "other"].includes(data.intent) ? data.intent : "other";
+  return { intent, reason: String(data.reason ?? "") };
+}
+
+/** What the agent is told when a reply comes in. */
+function replyTrigger(thread: Thread, intent: Intent, history: string, reply: string): string {
+  return `The prospect just replied. Classified as: ${intent}.
+
+State object: ${JSON.stringify(thread.state)}
+Meeting currently booked: ${thread.meeting ? `${thread.meeting.when} (${toIstInput(new Date(thread.meeting.start))}), link ${thread.meeting.link}` : "none"}
+Slots we last proposed: ${thread.state.times_proposed.join("; ") || "none"}
+
+Thread so far:
+${history}
+
+Latest reply from the prospect:
+"""${reply}"""
+
+Handle it.`;
+}
 
 /**
  * A reply from the prospect arrived. First the branch: what kind of reply is
@@ -354,31 +443,8 @@ async function handleReply(threadId: number, text: string) {
   await checkpoint(thread, "email_in", "Prospect replied", reply);
 
   const history = await conversationText(threadId);
-  const { data } = await generateJson<{ intent: Intent; reason: string }>(
-    `Classify the prospect's latest reply in a sales email thread about booking a call.
-
-State: ${JSON.stringify(thread.state)}
-Meeting currently booked: ${thread.meeting ? thread.meeting.when : "none"}
-Slots we last proposed: ${thread.state.times_proposed.join("; ") || "none"}
-
-Thread so far:
-${history}
-
-Latest reply from the prospect:
-"""${reply}"""
-
-Choose one intent:
-- "interested": wants to talk, but names no specific time.
-- "confirms_time": accepts one of the slots we proposed.
-- "counter_proposal": no meeting is booked yet and they name a different time of their own.
-- "reschedule": a meeting is already booked and they ask to move it, even by a few minutes.
-- "not_interested": declines, asks to stop, or says it is not relevant.
-- "other": anything else - a question, an out-of-office, a referral to a colleague, unclear.
-
-Return JSON: {"intent": string, "reason": one short sentence}`,
-    { temperature: 0, fast: true },
-  );
-  const intent: Intent = ["interested", "not_interested", "confirms_time", "counter_proposal", "reschedule", "other"].includes(data.intent) ? data.intent : "other";
+  const data = await classifyReply(thread.state, thread.meeting ? thread.meeting.when : null, history, reply);
+  const intent = data.intent;
 
   if (intent === "other") {
     await flagHuman(thread, `their reply needs a person to answer ("${reply.slice(0, 120)}")`, ctx.who);
@@ -392,23 +458,7 @@ Return JSON: {"intent": string, "reason": one short sentence}`,
   }
   await checkpoint(thread, "branch", `Branch: prospect ${intent.replace("_", " ")} (${data.reason})`);
 
-  const run = await runAgent(
-    thread, ctx,
-    `The prospect just replied. Classified as: ${intent}.
-
-State object: ${JSON.stringify(thread.state)}
-Meeting currently booked: ${thread.meeting ? `${thread.meeting.when} (${toIstInput(new Date(thread.meeting.start))}), link ${thread.meeting.link}` : "none"}
-Slots we last proposed: ${thread.state.times_proposed.join("; ") || "none"}
-
-Thread so far:
-${history}
-
-Latest reply from the prospect:
-"""${reply}"""
-
-Handle it.`,
-    intent === "not_interested" ? ["send_email"] : TOOLS.map((t) => t.name),
-  );
+  const run = await runAgent(thread, ctx, replyTrigger(thread, intent, history, reply), intent === "not_interested" ? ["send_email"] : TOOLS.map((t) => t.name));
 
   // Safety nets, in code: the outcome must not depend on the model remembering the last step.
   if (run.booked && !run.emailedAfterBooking && thread.meeting) {
@@ -590,4 +640,97 @@ export async function schedulingSnapshot() {
     calendar,
     rules: { followUpAfterHours: FOLLOW_UP_AFTER_HOURS, concludeAfterHours: CONCLUDE_AFTER_HOURS, workHours: `${WORK_START_HOUR}:00 to ${WORK_END_HOUR}:00 IST`, meetingMinutes: MEETING_MINUTES },
   };
+}
+
+// ------------------------------------------------------------- eval sandbox
+
+export type SandboxSetup = {
+  /** The prospect's reply. Leave out to run the silence follow-up instead. */
+  reply?: string;
+  state?: Partial<State>;
+  /** A meeting already booked, as YYYY-MM-DDTHH:MM in IST. */
+  meetingAt?: string;
+  /** Slots that are busy on the fake calendar, as YYYY-MM-DDTHH:MM in IST. */
+  busy?: string[];
+};
+
+export type SandboxResult = {
+  intent: Intent | "follow_up";
+  reason: string;
+  humanFlagged: boolean;
+  checks: { slot: string; status: string }[];
+  proposals: string[][];
+  bookings: string[];
+  blocked: string[];
+  emails: string[];
+  meetingLink: string | null;
+  error?: string;
+};
+
+/**
+ * Runs one scripted reply through the real classifier, agent loop and tool
+ * rules, with a fake calendar and a fake mailer: nothing is sent, booked or
+ * stored. Used by the scheduler evals (SCH-01 to SCH-13).
+ */
+export async function sandboxRun(setup: SandboxSetup): Promise<SandboxResult> {
+  const settings = await getSettings();
+  const busy = (setup.busy ?? []).map((k) => parseIst(k)!.getTime());
+  const record = { proposals: [] as string[][], bookings: [] as string[], blocked: [] as string[] };
+  const emails: string[] = [];
+  const checks: { slot: string; status: string }[] = [];
+  const meetingFor = (key: string): Meeting => {
+    const start = parseIst(key)!;
+    return { start: start.toISOString(), end: new Date(start.getTime() + MEETING_MINUTES * 60_000).toISOString(), when: formatIst(start), link: `https://meet.google.com/sbx-${Math.random().toString(36).slice(2, 8)}`, eventId: 0 };
+  };
+  const io: IO = {
+    check: async (key) => {
+      const start = parseIst(key)!;
+      const broken = slotRule(start);
+      const clash = busy.some((b) => b < start.getTime() + MEETING_MINUTES * 60_000 && b + MEETING_MINUTES * 60_000 > start.getTime());
+      const result: Availability = broken ? { status: "busy", reason: broken } : clash ? { status: "busy", reason: "another event is at that time" } : { status: "free" };
+      checks.push({ slot: key, status: result.status });
+      return result;
+    },
+    book: async (_thread, key) => meetingFor(key),
+    send: async (_thread, body) => {
+      emails.push(body);
+      return null;
+    },
+    checkpoint: async () => {},
+    notify: async () => {},
+    record,
+  };
+  const thread = {
+    id: -1, company_id: -1, subject: "Re: quick question",
+    state: { ...INITIAL_STATE, reply_status: "interested", ...(setup.state ?? {}) } as State,
+    meeting: setup.meetingAt ? meetingFor(setup.meetingAt) : null,
+  } as Thread;
+  if (setup.meetingAt) thread.state.meeting_status = "confirmed";
+  const ctx: Ctx = {
+    company: { name: "Acme Test Co" }, contact: { first_name: "Alex", last_name: "Rivera", title: "CTO", email: null },
+    sender: settings.senderName || "Sam", seller: settings.companyName, product: `${settings.companyName}: ${settings.product}`, who: "Alex Rivera (Acme Test Co)",
+  };
+  const history = `[US]\nHi Alex,\n\nA short note from ${ctx.seller} about ${settings.product.slice(0, 120)}.\n\nWorth a quick call?\n\n${ctx.sender}`;
+  const out = (intent: SandboxResult["intent"], reason: string, humanFlagged: boolean, error?: string): SandboxResult => ({
+    intent, reason, humanFlagged, checks, proposals: record.proposals, bookings: record.bookings, blocked: record.blocked, emails, meetingLink: thread.meeting?.link ?? null, error,
+  });
+  try {
+    if (!setup.reply) {
+      const run = await runAgent(thread, ctx, `The prospect has not replied for ${FOLLOW_UP_AFTER_HOURS} hours. Send the one follow-up.\n\nState object: ${JSON.stringify(thread.state)}\nSlots we last proposed: ${thread.state.times_proposed.join("; ") || "none"}\n\nThread so far:\n${history}`, ["send_email"], io);
+      return out("follow_up", "", run.emails === 0);
+    }
+    const { intent, reason } = await classifyReply(thread.state, thread.meeting?.when ?? null, history, setup.reply);
+    if (intent === "other") return out(intent, reason, true);
+    thread.state.reply_status = intent === "not_interested" ? "not_interested" : "interested";
+    if (intent === "counter_proposal" || intent === "reschedule") {
+      thread.state.calendar_checked = false;
+      thread.state.reply_round += 1;
+    }
+    const run = await runAgent(thread, ctx, replyTrigger(thread, intent, history, setup.reply), intent === "not_interested" ? ["send_email"] : TOOLS.map((t) => t.name), io);
+    // The same safety net as a real reply: a booking always ends with the link going out.
+    if (run.booked && !run.emailedAfterBooking && thread.meeting) emails.push(`Hi Alex,\n\nYou're booked for ${thread.meeting.when}.\n\nMeeting link: ${thread.meeting.link}\n\nSee you then.\n\n${ctx.sender}`);
+    return out(intent, reason, run.calls === 0 || (run.emails === 0 && !run.booked));
+  } catch (err) {
+    return out("other", "", true, (err as Error).message);
+  }
 }

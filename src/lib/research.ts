@@ -1,3 +1,4 @@
+import { sourcedSignal } from "./evals/checks";
 import type { Row } from "./db";
 import { generate, generateJson } from "./gemini";
 import { rankTitle, type FitQuestion, type IcpProfile, type Settings } from "./icp";
@@ -213,7 +214,8 @@ Rules:
   answer "no" only when the material clearly shows it - missing evidence is "unknown". For value questions give
   the short value, or "unknown".
 ${questions.map((q) => `  - ${q.id} (${q.kind === "value" ? "value" : "yes/no"}): ${q.label}. ${q.rule}`).join("\n")}
-- signals: up to 6 short factual signals relevant to the ICP, each naming the page it came from.
+- signals: up to 6 short factual signals relevant to the ICP. "source" is the page it came from (e.g. "Homepage",
+  "Security page", "Careers page", or the news source and date). Leave out a signal you cannot tie to a page.
 
 Return JSON:
 {"name": company name, "description": one sentence on what the company does,
@@ -221,12 +223,13 @@ Return JSON:
  "funding_stage": "Seed"|"Series A"|"Series B"|"Series C"|"Series D+"|"Bootstrapped"|"Public"|"unknown",
  "last_funding": string, "hq": string, "employees": string, "target_markets": string,
  "certifications_held": ${incumbent.label.toLowerCase()}, e.g. ${incumbent.example},
- "signals": [string]}`,
+ "signals": [{"text": string, "source": string}]}`,
     { temperature: 0.1, fast: true },
   );
   const answers: Record<string, string> = {};
   for (const q of questions) answers[q.id] = String(data.answers?.[q.id] ?? "unknown").trim() || "unknown";
-  return { ...data, answers, signals: Array.isArray(data.signals) ? data.signals : [] };
+  // Eval SCO-04: each signal ends with its source; signals with none are dropped.
+  return { ...data, answers, signals: (Array.isArray(data.signals) ? (data.signals as unknown[]) : []).map(sourcedSignal).filter((x): x is string => !!x) };
 }
 
 /** Which questions are still open. Decided in code, not by the model, so it is predictable. */
@@ -521,17 +524,30 @@ Rules:
 
 Answer in plain text, exactly in this shape (plain text keeps the source links attached to the answer):
 SUMMARY: one or two sentences on who they are and what they own
-- one short fact, ending with its source in brackets
-- (up to 5 such lines)
+- one short fact, ending with the full URL of its source page in brackets, e.g. [https://example.com/page]
+- (up to 5 such lines; leave out any fact you cannot give a URL for)
 If you find nothing beyond their title, answer exactly: SUMMARY: No public information found beyond their title.`,
-    { search: true, fast: true, temperature: 0.1 },
+    // Not "fast": with low thinking the model tends to answer from memory instead of searching.
+    { search: true, temperature: 0.1 },
   );
   const answer = search.text.split("\n").map((line) => line.trim());
   const summary = (answer.find((line) => /^SUMMARY:/i.test(line)) ?? "").replace(/^SUMMARY:\s*/i, "") || "No public information found beyond their title.";
-  const claims = answer.filter((line) => /^[-*•]\s+/.test(line)).map((line) => line.replace(/^[-*•]\s+/, "").replace(/\*\*/g, "")).slice(0, 5);
+  // Eval POC-05: every claim keeps the URL it cites; a claim that cites no URL is dropped (fewer true facts beat more doubtful ones).
+  const cited = answer
+    .filter((line) => /^[-*•]\s+/.test(line))
+    .map((line) => line.replace(/^[-*•]\s+/, "").replace(/\*\*/g, ""))
+    .map((line) => {
+      const url = (line.match(/https?:\/\/[^\s\])>]+/) ?? [])[0]?.replace(/[.,;]+$/, "") ?? null;
+      const text = line.replace(/\s*[[(]\s*(source:\s*)?https?:\/\/[^\])]*[\])]\s*\.?$/i, "").replace(/\s*https?:\/\/\S+\s*$/, "").trim();
+      return { text, url };
+    })
+    .filter((c) => c.url && c.text)
+    .slice(0, 5);
+  const claims = cited.map((c) => c.text);
   // The search answer is only a lead. Each claim is checked against the text
-  // of the pages it came from before it may be used.
-  const checked = await verifyFacts(company.id, claims, search.sourceUrls, readPages);
+  // of the pages it came from (the ones it cites, plus any the search returned) before it may be used.
+  const checked = await verifyFacts(company.id, claims, [...new Set([...cited.map((c) => c.url!), ...search.sourceUrls])], readPages);
+  for (const [i, f] of checked.facts.entries()) if (!f.url) f.url = cited[i]?.url ?? null;
   const facts = checked.facts;
   await store(company.id, "contacts", {
     pageType: "person_search", url: "google-search:person", status: 200, title: `Search: ${name}`, description: "",

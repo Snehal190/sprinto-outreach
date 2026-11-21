@@ -73,6 +73,8 @@ export type IcpProfile = {
   painTopic: string;
   /** Cheap keyword findings the scraper notes on every page. `pattern` is a case-insensitive regular expression. */
   keywords: { label: string; pattern: string }[];
+  /** Eval ICP-06: contradictions or vague parts in the ICP, shown to the user before searching. */
+  warnings?: string[];
 };
 
 const HUNTER_DEPARTMENTS = ["executive", "it", "finance", "management", "sales", "legal", "support", "hr", "marketing", "communication", "education", "design", "health", "operations"];
@@ -207,6 +209,7 @@ function clean(raw: Partial<IcpProfile>, key: string): IcpProfile {
       .map((k) => ({ label: text(k?.label, ""), pattern: text(k?.pattern, "") }))
       .filter((k) => k.label && k.pattern)
       .slice(0, 8),
+    warnings: list(raw.warnings).slice(0, 4),
   };
 }
 
@@ -237,9 +240,11 @@ Rules:
 - keywords: up to 7 case-insensitive JavaScript regular expressions that flag useful signals on a web page.
 - competitors: tools or vendors that mean the prospect already has a solution. Empty list if none.
 - incumbent: what to record that the prospect already has (label and an example value).
+- warnings: anything in the ICP that contradicts itself (e.g. "pre-seed companies with 10,000 staff") or is too vague
+  to search for, each as one short sentence telling the user what to fix. Empty list when the ICP is clear.
 
 Return JSON with exactly these keys: summary, questions, rubric, leadWith, discovery, newsQuery, incumbent,
-competitors, roles, hunterDepartments, researchTopics, painTopic, keywords.`,
+competitors, roles, hunterDepartments, researchTopics, painTopic, keywords, warnings.`,
     { temperature: 0.2 },
   );
   return clean(data, key);

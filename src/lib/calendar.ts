@@ -38,6 +38,24 @@ export function formatIst(date: Date): string {
 export type Availability = { status: "free" | "busy" | "no-calendar-access"; reason?: string };
 
 /**
+ * The meeting rules that hold whatever the calendar says: not in the past, not
+ * more than 30 days out, Monday to Friday only, and between 09:00 and 18:00
+ * IST. Returns the broken rule, or null when the slot is allowed. Used by
+ * check_calendar, by book_meeting as a last guard, and by the evals.
+ */
+export function slotRule(start: Date, minutes = MEETING_MINUTES, now = Date.now()): string | null {
+  if (start.getTime() <= now) return "that time is in the past";
+  if (start.getTime() - now > MAX_DAYS_AHEAD * 86_400_000) return `more than ${MAX_DAYS_AHEAD} days out, not bookable yet`;
+  const ist = new Date(start.getTime() + IST_OFFSET_MS);
+  if (ist.getUTCDay() === 0 || ist.getUTCDay() === 6) return "that is a weekend; meetings are Monday to Friday only";
+  const startMinutes = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  if (startMinutes < WORK_START_HOUR * 60 || startMinutes + minutes > WORK_END_HOUR * 60) {
+    return `outside meeting hours (${WORK_START_HOUR}:00 to ${WORK_END_HOUR}:00 IST)`;
+  }
+  return null;
+}
+
+/**
  * Is this exact date and time free for a meeting? Besides clashes with other
  * events, a slot counts as busy when it is in the past, on a Saturday or
  * Sunday, outside 09:00-18:00 IST, or more than 30 days out. `ignoreThreadId` leaves out that prospect's
@@ -47,19 +65,8 @@ export async function checkCalendar(dateText: string, ignoreThreadId?: number, m
   const start = parseIst(dateText);
   if (!start) return { status: "busy", reason: "the date could not be read; use YYYY-MM-DDTHH:MM in IST" };
   const end = new Date(start.getTime() + minutes * 60_000);
-  const now = Date.now();
-  if (start.getTime() <= now) return { status: "busy", reason: "that time is in the past" };
-  if (start.getTime() - now > MAX_DAYS_AHEAD * 86_400_000) return { status: "busy", reason: `more than ${MAX_DAYS_AHEAD} days out, not bookable yet` };
-
-  const ist = new Date(start.getTime() + IST_OFFSET_MS);
-  // Guardrail: no meetings on Saturday or Sunday (IST).
-  if (ist.getUTCDay() === 0 || ist.getUTCDay() === 6) {
-    return { status: "busy", reason: "that is a weekend; meetings are Monday to Friday only" };
-  }
-  const startMinutes = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-  if (startMinutes < WORK_START_HOUR * 60 || startMinutes + minutes > WORK_END_HOUR * 60) {
-    return { status: "busy", reason: `outside meeting hours (${WORK_START_HOUR}:00 to ${WORK_END_HOUR}:00 IST)` };
-  }
+  const broken = slotRule(start, minutes);
+  if (broken) return { status: "busy", reason: broken };
 
   try {
     if (await googleAccount()) {
@@ -92,6 +99,9 @@ export async function bookMeeting(
 ): Promise<Meeting> {
   const start = parseIst(dateText);
   if (!start) throw new Error("The date could not be read");
+  // Kill guard (eval SCH-02/SCH-03): never book a slot that breaks the meeting rules, whatever called this.
+  const broken = slotRule(start, minutes);
+  if (broken) throw new Error(`Booking blocked: ${broken}`);
   const end = new Date(start.getTime() + minutes * 60_000);
   if (await googleAccount()) {
     // Google Calendar: create the new event (with a Meet link, inviting the

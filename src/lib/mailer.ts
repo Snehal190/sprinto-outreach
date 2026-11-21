@@ -1,5 +1,6 @@
 import { gmailSend, googleAccount, type GmailSent } from "./google";
 import { forgetApiTest } from "./health";
+import { guard, recipientsAllowed } from "./evals/checks";
 
 // Outbound email. Every email the app sends goes through deliver(), so the
 // recipient lock is enforced in exactly one place. With Google connected the
@@ -58,6 +59,8 @@ export async function deliver(email: {
     if (!email.prospectEmail) throw new Error("There is no email address for this contact");
     recipients = [email.prospectEmail];
   }
+  // Kill guard (eval SND-01): while the lock is on, nothing may go anywhere but the test addresses.
+  guard("SND-01", recipientsAllowed(recipients, locked));
 
   if (account) {
     // Sent from the sender's own Gmail. Their own address is left off the "To"

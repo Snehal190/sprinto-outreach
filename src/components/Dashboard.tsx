@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { NotificationList, ThreadPanel } from "./Scheduling";
+import { EvalsView } from "./Evals";
 import { card, field, ghostBtn, label, primaryBtn, type CalendarEvent, type Notice, type Rules, type Run, type Thread } from "./shared";
 
 type Contact = {
@@ -82,12 +83,14 @@ type Company = {
   contact: Contact | null;
   draft: Draft | null;
   thread: Thread | null;
+  /** Code checks from the last funnel step that failed (evals, moment 2). */
+  checks: { case_id: string; severity: "kill" | "hard" | "soft"; detail: string | null }[];
 };
 
 type Settings = { icp: string; product: string; companyName: string; senderName: string; senderTitle: string };
 
 /** What the funnel is doing for the current ICP (built from it in icp.ts). */
-type Profile = { summary: string; custom: boolean; leadWith: string; incumbent: string; questions: string[]; rubric: string[]; threshold: number };
+type Profile = { summary: string; custom: boolean; leadWith: string; incumbent: string; questions: string[]; rubric: string[]; threshold: number; warnings: string[] };
 
 const DEFAULT_ICP: Pick<Settings, "icp" | "product" | "companyName"> = {
   icp: "SaaS companies, typically Series A-C, that are either preparing for a compliance audit or are under pressure from enterprise customers to get certified.",
@@ -109,6 +112,7 @@ type State = {
     google: { configured: boolean; email: string | null };
   };
   apis: ApiStatus[];
+  lastEval: { id: number; passed: boolean; kill: number; hard: number; soft: number; finished_at: string } | null;
 };
 
 type ApiStatus = { api: string; label: string; ok: boolean; off: boolean; detail: string; short: string; ms: number; checkedAt: string };
@@ -120,7 +124,7 @@ export default function Dashboard() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [tab, setTab] = useState<"funnel" | "qualified">("funnel");
+  const [tab, setTab] = useState<"funnel" | "qualified" | "evals">("funnel");
   const [bellOpen, setBellOpen] = useState(false);
 
   useEffect(() => {
@@ -170,7 +174,11 @@ export default function Dashboard() {
         setNotice(data.result.added ? `Added ${data.result.added} new companies.` : "No new companies were found this time.");
       }
       if (action === "addCompanies") {
-        setNotice(data.result.added ? `Added ${data.result.added} companies. Researching their websites now.` : "Those companies are already in the list.");
+        const skipped: string[] = data.result.skipped ?? [];
+        setNotice(
+          (data.result.added ? `Added ${data.result.added} companies. Researching their websites now.` : "Those companies are already in the list.") +
+            (skipped.length ? ` Skipped ${skipped.length} line${skipped.length === 1 ? "" : "s"} that are not websites: ${skipped.slice(0, 5).join(", ")}.` : ""),
+        );
       }
       if (action === "receiveReply") {
         setNotice(
@@ -367,6 +375,7 @@ export default function Dashboard() {
               [
                 ["funnel", "Funnel"],
                 ["qualified", `Qualified · ${qualified.length}`],
+                ["evals", state.lastEval ? `Evals · ${state.lastEval.passed ? "passed" : "failed"}` : "Evals"],
               ] as const
             ).map(([key, name]) => (
               <button
@@ -381,7 +390,9 @@ export default function Dashboard() {
           </div>
         </nav>
 
-        {tab === "qualified" ? (
+        {tab === "evals" ? (
+          <EvalsView />
+        ) : tab === "qualified" ? (
           <QualifiedView
             companies={qualified}
             threshold={state.profile.threshold}
@@ -446,6 +457,7 @@ export default function Dashboard() {
                       {c.contact && <Tag>POC</Tag>}
                       {c.draft && !c.thread && <Tag>{c.draft.status === "draft" ? "Drafted" : c.draft.status === "sent" ? "Sent" : "Send simulated"}</Tag>}
                       {c.thread && <Tag dark={c.thread.needs_human}>{c.thread.status_label}</Tag>}
+                      {c.checks?.length > 0 && <Tag dark>{c.checks.length} check{c.checks.length === 1 ? "" : "s"} failed</Tag>}
                     </div>
                   </button>
                 </li>
@@ -621,6 +633,16 @@ function SettingsCard({ settings, profile, run, busy }: { settings: Settings; pr
               </>
             )}
           </div>
+          {!icpChanged && profile.warnings?.length > 0 && (
+            <div className="mt-3 rounded-2xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+              <p className="font-bold">Check your ICP before searching</p>
+              <ul className="mt-1 list-disc space-y-0.5 pl-5">
+                {profile.warnings.map((w, i) => (
+                  <li key={i}>{w}</li>
+                ))}
+              </ul>
+            </div>
+          )}
           {!icpChanged && (
             <details className="mt-3 rounded-2xl bg-white px-4 py-3 text-sm text-ink/70">
               <summary className="cursor-pointer font-semibold text-ink">
@@ -775,6 +797,18 @@ function Detail({ company: c, run, busy, config, rules, profile }: { company: Co
         </div>
       </div>
 
+      {c.checks?.length > 0 && (
+        <div className="mt-5 rounded-2xl border border-primary/20 bg-blush px-4 py-3 text-sm">
+          <p className="font-bold text-primary">Eval checks failed after the last step</p>
+          <ul className="mt-1 space-y-1 text-ink/80">
+            {c.checks.map((x, i) => (
+              <li key={i}>
+                <span className="font-mono text-xs font-bold">{x.case_id}</span> <span className="text-[10px] font-bold uppercase text-ink/50">{x.severity}</span> · {x.detail}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       <p className="mt-4 text-sm leading-relaxed text-ink/80">{c.description}</p>
 
       <div className="mt-5 rounded-3xl bg-blush p-5">
@@ -1031,13 +1065,16 @@ function DraftEditor({ draft, contact, run, busy, config }: { draft: Draft; cont
   const edited = draft.subject !== draft.original_subject || draft.body !== draft.original_body;
   const words = body.trim().split(/\s+/).filter(Boolean).length;
 
+  // Asked on the page, not in a browser popup: a popup can be blocked or
+  // dismissed without a trace, which made Send look like it did nothing (eval SND-03).
+  const [confirming, setConfirming] = useState(false);
+  const target = config.resend && config.testRecipient
+    ? `Test mode: send this email to ${config.testRecipient}? Nothing goes to the prospect.`
+    : config.resend
+    ? `Send this email to ${contact.email}? This cannot be undone.`
+    : "Resend is not connected, so this will only be recorded as a simulated send. Continue?";
   const send = async () => {
-    const target = config.resend && config.testRecipient
-      ? `Test mode: send this email to ${config.testRecipient}? Nothing goes to the prospect.`
-      : config.resend
-      ? `Send this email to ${contact.email}? This cannot be undone.`
-      : "Resend is not connected, so this will only be recorded as a simulated send. Continue?";
-    if (!window.confirm(target)) return;
+    setConfirming(false);
     if (dirty && !(await run("saveDraft", { id: draft.id, draft: { subject, body, feedback } }))) return;
     await run("send", { id: draft.id });
   };
@@ -1151,9 +1188,22 @@ function DraftEditor({ draft, contact, run, busy, config }: { draft: Draft; cont
           <button disabled={busy !== null || !dirty} onClick={() => run("saveDraft", { id: draft.id, draft: { subject, body, feedback } })} className={ghostBtn}>
             {busy === "saveDraft" ? "Saving…" : "Save changes"}
           </button>
-          <button disabled={busy !== null || (!contact.email && !config.testRecipient)} onClick={send} className={primaryBtn}>
+          <button disabled={busy !== null || confirming || (!contact.email && !config.testRecipient)} onClick={() => setConfirming(true)} className={primaryBtn}>
             {busy === "send" ? "Sending…" : !config.resend ? "Send (simulated)" : config.testRecipient ? "Send to test addresses" : "Send email"}
           </button>
+        </div>
+      )}
+      {!done && confirming && (
+        <div role="alertdialog" aria-label="Confirm send" className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-primary/30 bg-blush px-4 py-3 text-sm">
+          <span className="font-semibold text-ink">{target}</span>
+          <span className="flex gap-2">
+            <button onClick={() => setConfirming(false)} className={ghostBtn}>
+              Cancel
+            </button>
+            <button disabled={busy !== null} onClick={send} className={primaryBtn}>
+              Yes, send
+            </button>
+          </span>
         </div>
       )}
     </div>

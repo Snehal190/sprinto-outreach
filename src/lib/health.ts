@@ -129,3 +129,26 @@ export async function mailApi(): Promise<ApiName[]> {
   if (await googleAccount()) return ["google"];
   return resendLive() ? ["resend"] : [];
 }
+
+/** The APIs each step calls. They are tested (free, cached) before the step starts. */
+export async function apisFor(action: string): Promise<ApiName[]> {
+  const google: ApiName[] = (await googleAccount()) ? ["google"] : [];
+  switch (action) {
+    case "discover":
+    case "scrape":
+    case "researchPoc":
+    case "draft":
+    case "findPoc": // Hunter is tested inside the lookup, only when the domain is not cached
+      return ["gemini"];
+    case "send":
+      return mailApi();
+    case "checkInbox":
+    case "resetThread":
+      return google;
+    default:
+      return [];
+  }
+}
+
+/** Steps that spend paid API calls; each must map to at least one API check (evals SND-02, SYS-01). */
+export const PAID_ACTIONS = ["discover", "scrape", "researchPoc", "draft", "findPoc", "send"] as const;

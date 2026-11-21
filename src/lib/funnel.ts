@@ -7,6 +7,8 @@ import { googleAccount, googleConfigured } from "./google";
 import { forgetApiTest, requireApis, testAllApis } from "./health";
 import { schedulingSnapshot, startThread } from "./scheduler";
 import { describeOpen, findContactsOnWebsite, qualifyFromWebsite, researchPerson, type Person, type PersonResearch } from "./research";
+import { draftSafety, guard, icpDetail, sourcedSignal } from "./evals/checks";
+import { stepFailures } from "./evals/runner";
 import { DEFAULT_SETTINGS, getProfile, getSettings, icpKey, rankTitle, type IcpProfile, type Settings } from "./icp";
 
 export { getSettings, type Settings };
@@ -14,9 +16,22 @@ export { getSettings, type Settings };
 // The basic funnel: ICP -> discover -> score/shortlist -> POC + pain points
 // -> draft -> human edit -> send. Companies without enough information are
 // researched by the scraper (scraper.ts, research.ts). Human edits to drafts
-// feed the feedback loop (feedback.ts). Evals are not built yet.
+// feed the feedback loop (feedback.ts). Evals: src/lib/evals.
 
 export const SHORTLIST_THRESHOLD = 70;
+
+/**
+ * Eval ICP-05: an ICP too thin to build a profile from is refused with a clear
+ * message instead of being guessed at. Product and company name fall back to
+ * the defaults when left empty.
+ */
+export function validateSettings(next: Settings): Settings {
+  const out = { ...next, icp: String(next.icp ?? "").trim() };
+  const thin = icpDetail(out.icp);
+  if (thin) throw new Error(`Add more detail to the ICP: ${thin}.`);
+  for (const k of ["product", "companyName"] as const) out[k] = String(out[k] ?? "").trim() || DEFAULT_SETTINGS[k];
+  return out;
+}
 
 /**
  * Saves the settings. A new ICP first gets its profile (one model call), so a
@@ -25,10 +40,7 @@ export const SHORTLIST_THRESHOLD = 70;
  * them back.
  */
 export async function saveSettings(patch: Partial<Settings>): Promise<Settings> {
-  const next = { ...(await getSettings()), ...patch };
-  for (const k of ["icp", "product", "companyName"] as const) {
-    next[k] = String(next[k] ?? "").trim() || DEFAULT_SETTINGS[k];
-  }
+  const next = validateSettings({ ...(await getSettings()), ...patch });
   await getProfile(next);
   await sql(
     `INSERT INTO settings (key, value) VALUES ('funnel', $1::jsonb)
@@ -53,6 +65,10 @@ export async function getState() {
     schedulingSnapshot(),
   ]);
   const visible = new Set(companies.map((c) => c.id));
+  const [checks, lastEval] = await Promise.all([
+    stepFailures(companies.map((c) => c.id)),
+    sql(`SELECT id, passed, summary->'killFailed' AS kill, summary->'hardFailed' AS hard, summary->'softBelow' AS soft, finished_at FROM eval_runs WHERE icp_key = $1 AND status = 'done' ORDER BY id DESC LIMIT 1`, [key]),
+  ]);
   const google = { configured: googleConfigured(), email: await googleAccount() };
   const withLesson = (d: Row | undefined) => (d ? { ...d, lesson: lessons.find((l) => l.draft_id === d.id) ?? null } : null);
   return {
@@ -62,8 +78,10 @@ export async function getState() {
       contact: contacts.find((p) => p.company_id === c.id) ?? null,
       draft: withLesson(drafts.find((d) => d.company_id === c.id)),
       thread: scheduling.threads.find((t) => t.company_id === c.id) ?? null,
+      checks: checks.filter((x) => x.company_id === c.id).map((x) => ({ case_id: x.case_id, severity: x.severity, detail: x.detail })),
     })),
-    profile: { summary: profile.summary, custom: profile.custom, leadWith: profile.leadWith.label, incumbent: profile.incumbent.label, questions: profile.questions.map((q) => q.label), rubric: profile.rubric, threshold: SHORTLIST_THRESHOLD },
+    lastEval: lastEval[0] ?? null,
+    profile: { summary: profile.summary, custom: profile.custom, leadWith: profile.leadWith.label, incumbent: profile.incumbent.label, questions: profile.questions.map((q) => q.label), rubric: profile.rubric, threshold: SHORTLIST_THRESHOLD, warnings: profile.warnings ?? [] },
     notifications: scheduling.notifications.filter((n) => n.company_id === null || visible.has(n.company_id)),
     calendar: scheduling.calendar,
     rules: scheduling.rules,
@@ -112,7 +130,7 @@ function companyFacts(c: Row, profile: IcpProfile): string {
 
 // ---------------------------------------------------------------- discovery
 
-type Found = {
+export type Found = {
   name: string;
   domain: string;
   description?: string;
@@ -123,6 +141,8 @@ type Found = {
   target_markets?: string;
   certifications_held?: string;
   signals?: string[];
+  /** Where the search found the company (eval DIS-06). Checked by fetching it before it is stored. */
+  source_url?: string;
 };
 
 type Score = {
@@ -134,7 +154,7 @@ type Score = {
   missing_info?: string;
 };
 
-async function scoreCompanies(settings: Settings, profile: IcpProfile, found: Found[]): Promise<Score[]> {
+export async function scoreCompanies(settings: Settings, profile: IcpProfile, found: Found[]): Promise<Score[]> {
   const { data } = await generateJson<Score[] | Score>(
     `Score each company against this ICP for the seller described.
 
@@ -190,21 +210,32 @@ Return ONLY a JSON array, no prose, where each item is:
  "last_funding": e.g. "$20M Series A, March 2026" or "unknown", "hq": "City, Country",
  "employees": e.g. "51-200" or "unknown", "target_markets": who they sell to and in which regions,
  "certifications_held": ${profile.incumbent.label.toLowerCase()}, e.g. ${profile.incumbent.example},
- "signals": [short factual intent signals, each with its date or source where known]}`,
-    { search: true, temperature: 0.3, fast: true },
+ "source_url": the full URL of the page that shows why this company matches (the news article, funding announcement or job post
+   behind its signals); use its own website only if nothing else,
+ "signals": [{"text": a short factual intent signal, "source": where it came from with its date, e.g. "TechCrunch, Mar 2026" or "company blog"}]}
+Leave out any signal you cannot name a source for.`,
+    // Not "fast": with low thinking the model tends to answer from memory instead of searching.
+    { search: true, temperature: 0.3 },
   );
 
-  const found = parseJson<Found[]>(search.text)
-    .map((f) => ({ ...f, domain: cleanDomain(f.domain) }))
-    .filter((f) => f.name && f.domain && !known.includes(f.domain));
-  if (found.length === 0) return { added: 0 };
+  const returned = parseJson<Found[]>(search.text).map((f) => ({
+    ...f,
+    domain: cleanDomain(f.domain),
+    // Eval SCO-04: every signal names its source; unsourced ones are dropped.
+    signals: (Array.isArray(f.signals) ? f.signals : []).map(sourcedSignal).filter((x): x is string => !!x),
+  }));
+  // Eval DIS-04: how many returned companies were already in the list (they are dropped here).
+  const repeats = returned.filter((f) => known.includes(f.domain)).length;
+  const found = returned.filter((f) => f.name && f.domain && !known.includes(f.domain)).slice(0, count);
+  if (found.length === 0) return { added: 0, requested: count, returned: returned.length, repeats };
 
-  // Step 2: score each candidate against the ICP.
-  const scores = await scoreCompanies(settings, profile, found);
+  // Step 2: score each candidate against the ICP, and check each company's source page loads (eval DIS-06).
+  const [scores, checkedSources] = await Promise.all([scoreCompanies(settings, profile, found), Promise.all(found.map((f) => checkSource(f.source_url)))]);
 
   let added = 0;
-  for (const f of found) {
+  for (const [i, f] of found.entries()) {
     const s = scores.find((x) => cleanDomain(x.domain) === f.domain);
+    const sources = [...new Set([checkedSources[i], ...search.sourceUrls.length ? search.sources : []].filter((x): x is string => !!x))].slice(0, 12);
     const score = s ? Math.max(0, Math.min(100, Math.round(Number(s.fit_score) || 0))) : null;
     const rows = await sql(
       `INSERT INTO companies (name, domain, description, funding_stage, last_funding, hq, employees,
@@ -215,7 +246,7 @@ Return ONLY a JSON array, no prose, where each item is:
       [
         f.name, f.domain, f.description ?? null, f.funding_stage ?? null, f.last_funding ?? null,
         f.hq ?? null, f.employees ?? null, f.target_markets ?? null, f.certifications_held ?? null,
-        JSON.stringify(f.signals ?? []), JSON.stringify(search.sources.slice(0, 12)),
+        JSON.stringify(f.signals ?? []), JSON.stringify(sources),
         score, s?.fit_reason ?? null, s?.recommended_framework ?? null,
         s?.info_sufficient ?? false, s?.missing_info ?? null,
         score !== null && score >= SHORTLIST_THRESHOLD ? "shortlisted" : "candidate",
@@ -226,12 +257,30 @@ Return ONLY a JSON array, no prose, where each item is:
     );
     added += rows.length;
   }
-  return { added };
+  return { added, requested: count, returned: returned.length, repeats };
+}
+
+/**
+ * Eval DIS-06: the page the search says it found a company on, kept only if it
+ * really loads. Search redirect links are followed to the real page. Returns
+ * the final URL, or null.
+ */
+async function checkSource(url: string | undefined): Promise<string | null> {
+  if (!url || !/^https?:\/\//i.test(url)) return null;
+  try {
+    const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(10_000), headers: { "user-agent": "Mozilla/5.0 (compatible; OutreachBot/1.0)" } });
+    await res.body?.cancel().catch(() => {});
+    // 401/403 means the page exists but blocks bots, which still proves it is real.
+    return res.status < 400 || res.status === 401 || res.status === 403 ? res.url || url : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function setCompanyStatus(id: number, status: string) {
   if (!["candidate", "shortlisted", "rejected"].includes(status)) throw new Error("Invalid status");
-  await sql(`UPDATE companies SET status = $1 WHERE id = $2`, [status, id]);
+  // status_manual: the human chose this status, so it may differ from the score (eval SCO-02).
+  await sql(`UPDATE companies SET status = $1, status_manual = TRUE WHERE id = $2`, [status, id]);
 }
 
 export async function deleteCompany(id: number) {
@@ -241,11 +290,23 @@ export async function deleteCompany(id: number) {
 // ------------------------------------------------------------------ scraper
 
 /** The Growth Lead's own list of company websites. Each one is queued for the scraper. */
+/** Eval DIS-07: pasted lines become clean, unique domains (at most 25); anything else is reported as skipped. */
+export function normaliseWebsites(lines: string[]): { domains: string[]; skipped: string[] } {
+  const domains: string[] = [];
+  const skipped: string[] = [];
+  for (const line of lines.map((l) => String(l ?? "").trim()).filter(Boolean)) {
+    const domain = cleanDomain(line);
+    if (!/^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/.test(domain)) skipped.push(line);
+    else if (!domains.includes(domain)) domains.push(domain);
+  }
+  return { domains: domains.slice(0, 25), skipped };
+}
+
 export async function addCompanies(websites: string[]) {
   const key = icpKey(await getSettings());
   let added = 0;
-  for (const domain of [...new Set(websites.map(cleanDomain))]) {
-    if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(domain)) continue;
+  const { domains, skipped } = normaliseWebsites(websites);
+  for (const domain of domains) {
     const rows = await sql(
       `INSERT INTO companies (name, domain, info_sufficient, missing_info, scrape_status, icp_key)
        VALUES ($1, $1, FALSE, 'Not researched yet', 'pending', $2)
@@ -254,7 +315,7 @@ export async function addCompanies(websites: string[]) {
     );
     added += rows.length;
   }
-  return { added };
+  return { added, skipped };
 }
 
 const EXIT_TEXT: Record<string, string> = {
@@ -291,7 +352,7 @@ export async function scrapeCompany(id: number) {
       employees: keep(f?.employees, company.employees) ?? "unknown",
       target_markets: keep(f?.target_markets, company.target_markets) ?? "unknown",
       certifications_held: keep(f?.certifications_held, company.certifications_held) ?? "unknown",
-      signals: [...new Set([...(f?.signals ?? []), ...(company.signals ?? [])])].slice(0, 8),
+      signals: [...new Set([...(f?.signals ?? []), ...(company.signals ?? [])])].map(sourcedSignal).filter((x): x is string => !!x).slice(0, 8),
     };
 
     const summary = {
@@ -319,7 +380,7 @@ export async function scrapeCompany(id: number) {
       `UPDATE companies SET name=$1, description=$2, funding_stage=$3, last_funding=$4, hq=$5, employees=$6,
          target_markets=$7, certifications_held=$8, signals=$9::jsonb, fit_score=$10, fit_reason=$11,
          recommended_framework=$12, info_sufficient=$13, missing_info=$14, status=$15,
-         scrape_status='done', scrape_summary=$16::jsonb
+         scrape_status='done', scrape_summary=$16::jsonb, status_manual = (status = 'rejected' AND status_manual)
        WHERE id=$17`,
       [
         merged.name, merged.description ?? null, merged.funding_stage, merged.last_funding, merged.hq, merged.employees,
@@ -347,7 +408,22 @@ type HunterProfile = {
   company_type: string | null; location: string | null; technologies: string[]; linkedin: string | null;
 };
 
-async function hunterDomainSearch(domain: string, filters: Record<string, string>): Promise<{ people: Person[]; profile: HunterProfile }> {
+/**
+ * Kill guard (eval POC-02): at most one Hunter.io credit per company. Hunter
+ * charges for a search that returns people and for a found email; an empty
+ * search is free. Every charged request is logged in hunter_usage.
+ */
+async function hunterBudget(companyId: number) {
+  const used = (await sql(`SELECT coalesce(sum(credits), 0)::int AS n FROM hunter_usage WHERE company_id = $1`, [companyId]))[0]?.n ?? 0;
+  guard("POC-02", used >= 1 ? `this company has already used ${used} Hunter.io credit${used === 1 ? "" : "s"}` : null);
+}
+
+async function logHunter(companyId: number, domain: string, kind: string, credits: number) {
+  if (credits > 0) await sql(`INSERT INTO hunter_usage (company_id, domain, kind, credits) VALUES ($1,$2,$3,$4)`, [companyId, domain, kind, credits]);
+}
+
+async function hunterDomainSearch(companyId: number, domain: string, filters: Record<string, string>): Promise<{ people: Person[]; profile: HunterProfile }> {
+  await hunterBudget(companyId);
   const query = new URLSearchParams({ domain, limit: "10", type: "personal", ...filters });
   const res = await fetch(`https://api.hunter.io/v2/domain-search?${query}`, {
     headers: { "X-API-KEY": process.env.HUNTER_API_KEY! },
@@ -379,6 +455,7 @@ async function hunterDomainSearch(domain: string, filters: Record<string, string
     location: [d.city, d.state, d.country].filter(Boolean).join(", ") || null,
     technologies: Array.isArray(d.technologies) ? d.technologies : [], linkedin: d.linkedin ?? null,
   };
+  await logHunter(companyId, domain, "domain-search", (d.emails ?? []).length > 0 ? 1 : 0);
   return { people, profile };
 }
 
@@ -389,7 +466,7 @@ async function hunterDomainSearch(domain: string, filters: Record<string, string
  *  - it first asks only for senior people in the departments that own
  *    the ICP's buyer, and widens to everyone only when that returns nobody.
  */
-async function hunterSearch(domain: string, profile: IcpProfile): Promise<{ people: Person[]; profile: HunterProfile | null; cached: boolean }> {
+async function hunterSearch(companyId: number, domain: string, profile: IcpProfile): Promise<{ people: Person[]; profile: HunterProfile | null; cached: boolean }> {
   const hit = (await sql(`SELECT people, profile FROM hunter_cache WHERE domain = $1`, [domain]))[0];
   // The cache is shared by every ICP; the ranking depends on the ICP, so it is done on the way out.
   const ranked = (people: Person[]) => [...people].sort((a, b) => rankTitle(a.title, profile) - rankTitle(b.title, profile) || (b.confidence ?? 0) - (a.confidence ?? 0));
@@ -398,8 +475,8 @@ async function hunterSearch(domain: string, profile: IcpProfile): Promise<{ peop
   // About to spend a credit: make sure the key works and credits are left first.
   await requireApis(["hunter"]);
   const departments: Record<string, string> = profile.hunterDepartments.length ? { department: profile.hunterDepartments.join(",") } : {};
-  let result = await hunterDomainSearch(domain, { seniority: "senior,executive", ...departments });
-  if (result.people.length === 0) result = await hunterDomainSearch(domain, {});
+  let result = await hunterDomainSearch(companyId, domain, { seniority: "senior,executive", ...departments });
+  if (result.people.length === 0) result = await hunterDomainSearch(companyId, domain, {});
   await sql(
     `INSERT INTO hunter_cache (domain, people, profile) VALUES ($1, $2::jsonb, $3::jsonb)
      ON CONFLICT (domain) DO UPDATE SET people = EXCLUDED.people, profile = EXCLUDED.profile, fetched_at = now()`,
@@ -424,13 +501,15 @@ async function applyProfile(company: Row, profile: HunterProfile | null, icp: Ic
   ]);
 }
 
-async function hunterEmailFinder(domain: string, person: Person): Promise<{ email: string; confidence: number | null } | null> {
+async function hunterEmailFinder(companyId: number, domain: string, person: Person): Promise<{ email: string; confidence: number | null } | null> {
+  await hunterBudget(companyId);
   const query = new URLSearchParams({ domain, first_name: person.first_name, last_name: person.last_name });
   const res = await fetch(`https://api.hunter.io/v2/email-finder?${query}`, {
     headers: { "X-API-KEY": process.env.HUNTER_API_KEY! },
     signal: AbortSignal.timeout(30_000),
   }).catch(() => null);
   const data = res?.ok ? await res.json().catch(() => null) : null;
+  await logHunter(companyId, domain, "email-finder", data?.data?.email ? 1 : 0);
   return data?.data?.email ? { email: data.data.email, confidence: data.data.score ?? null } : null;
 }
 
@@ -472,7 +551,7 @@ export async function findPoc(companyId: number) {
   let person: Person | null = null;
   let source = "mock";
   if (process.env.HUNTER_API_KEY) {
-    const hunter = await hunterSearch(company.domain, profile);
+    const hunter = await hunterSearch(company.id, company.domain, profile);
     await applyProfile(company, hunter.profile, profile);
     person = hunter.people[0] ?? null;
     source = "hunter";
@@ -485,7 +564,7 @@ export async function findPoc(companyId: number) {
     source = "scraped";
     // A name without an email: ask Hunter for that specific person's address.
     if (person && !person.email && process.env.HUNTER_API_KEY) {
-      const found = await hunterEmailFinder(company.domain, person);
+      const found = await hunterEmailFinder(company.id, company.domain, person).catch(() => null);
       if (found) person = { ...person, ...found };
     }
   }
@@ -679,29 +758,46 @@ export async function saveDraft(id: number, patch: { subject?: string; body?: st
 export async function sendDraft(id: number) {
   const draft = (await sql(`SELECT * FROM drafts WHERE id = $1`, [id]))[0];
   if (!draft) throw new Error("Draft not found");
-  if (draft.status !== "draft") throw new Error("This email has already been sent");
-  const contact = (await sql(`SELECT * FROM contacts WHERE id = $1`, [draft.contact_id]))[0];
-  if (testRecipients().length === 0 && contact?.source === "mock") {
-    throw new Error("This is a placeholder contact. Find or enter the real POC before sending.");
-  }
-
-  const result = await deliver({ subject: draft.subject, body: draft.body, prospectEmail: contact?.email ?? null });
-  // Feedback loop trigger on send: the version that went out is the final one.
-  // If the human changed the email or wrote a note and no lesson was captured
-  // yet (or the last capture failed), capture it now from the sent version.
-  const edited = draft.subject !== draft.original_subject || draft.body !== draft.original_body || String(draft.feedback ?? "").trim() !== "";
-  const hasLesson = (await sql(`SELECT 1 FROM lessons WHERE draft_id = $1`, [id])).length > 0;
-  if (edited && !hasLesson) {
-    try {
-      await captureLesson(id);
-    } catch (err) {
-      console.error("Feedback capture on send failed:", err);
+  // Eval SND-03: every press of Send ends in a logged result or a logged error, never silence.
+  const log = (ok: boolean, extra: { mode?: string; recipients?: string[]; error?: string }) =>
+    sql(`INSERT INTO send_log (draft_id, company_id, ok, mode, recipients, error) VALUES ($1,$2,$3,$4,$5::jsonb,$6)`, [
+      id, draft.company_id, ok, extra.mode ?? null, JSON.stringify(extra.recipients ?? []), extra.error ?? null,
+    ]).catch((err) => console.error("send_log write failed:", err));
+  try {
+    if (draft.status !== "draft") throw new Error("This email has already been sent");
+    const contact = (await sql(`SELECT * FROM contacts WHERE id = $1`, [draft.contact_id]))[0];
+    // Kill guard (eval POC-07): a placeholder contact is never emailed once the test lock is off.
+    if (testRecipients().length === 0 && contact?.source === "mock") {
+      throw new Error("This is a placeholder contact. Find or enter the real POC before sending.");
     }
+    // Kill guard (eval DRF-04): no links or placeholders in an outreach email.
+    guard("DRF-04", draftSafety(draft.subject, draft.body));
+    // Kill guard (eval SND-06): a second Send of the same draft within 30 seconds is a double-click.
+    const recent = await sql(`SELECT 1 FROM send_log WHERE draft_id = $1 AND ok AND created_at > now() - interval '30 seconds' LIMIT 1`, [id]);
+    guard("SND-06", recent.length ? "this draft was sent less than 30 seconds ago" : null);
+
+    const result = await deliver({ subject: draft.subject, body: draft.body, prospectEmail: contact?.email ?? null });
+    await log(true, { mode: result.mode, recipients: result.delivered });
+    // Feedback loop trigger on send: the version that went out is the final one.
+    // If the human changed the email or wrote a note and no lesson was captured
+    // yet (or the last capture failed), capture it now from the sent version.
+    const edited = draft.subject !== draft.original_subject || draft.body !== draft.original_body || String(draft.feedback ?? "").trim() !== "";
+    const hasLesson = (await sql(`SELECT 1 FROM lessons WHERE draft_id = $1`, [id])).length > 0;
+    if (edited && !hasLesson) {
+      try {
+        await captureLesson(id);
+      } catch (err) {
+        console.error("Feedback capture on send failed:", err);
+      }
+    }
+    await markSent(id);
+    if (result.mode === "live") await sql(`UPDATE drafts SET status = 'sent', sent_at = now() WHERE id = $1`, [id]);
+    if (result.mode === "simulated") await sql(`UPDATE drafts SET status = 'simulated', sent_at = now() WHERE id = $1`, [id]);
+    const sentTo = result.mode === "simulated" ? "simulated, Resend not connected" : `to ${result.delivered.join(", ")}${result.gmail ? " from Gmail" : ""}`;
+    await startThread(draft.company_id, draft.subject, draft.body, sentTo, result.gmail);
+    return { status: result.mode === "live" ? "sent" : result.mode, to: result.delivered.join(", "), failed: result.failed };
+  } catch (err) {
+    await log(false, { error: (err as Error).message });
+    throw err;
   }
-  await markSent(id);
-  if (result.mode === "live") await sql(`UPDATE drafts SET status = 'sent', sent_at = now() WHERE id = $1`, [id]);
-  if (result.mode === "simulated") await sql(`UPDATE drafts SET status = 'simulated', sent_at = now() WHERE id = $1`, [id]);
-  const sentTo = result.mode === "simulated" ? "simulated, Resend not connected" : `to ${result.delivered.join(", ")}${result.gmail ? " from Gmail" : ""}`;
-  await startThread(draft.company_id, draft.subject, draft.body, sentTo, result.gmail);
-  return { status: result.mode === "live" ? "sent" : result.mode, to: result.delivered.join(", "), failed: result.failed };
 }
