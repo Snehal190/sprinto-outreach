@@ -71,6 +71,8 @@ type Company = {
   info_sufficient: boolean;
   missing_info: string | null;
   status: "candidate" | "shortlisted" | "rejected";
+  /** The human set the status by hand, so it can differ from the score. */
+  status_manual: boolean;
   profile: { industry: string | null; company_type: string | null; technologies: string[] } | null;
   scrape_status: "none" | "pending" | "done" | "failed";
   scrape_summary: {
@@ -459,6 +461,7 @@ export default function Dashboard() {
                       {c.thread && <Tag dark={c.thread.needs_human}>{c.thread.status_label}</Tag>}
                       {c.checks?.length > 0 && <Tag dark>{c.checks.length} check{c.checks.length === 1 ? "" : "s"} failed</Tag>}
                     </div>
+                    <VerdictLine c={c} threshold={state.profile.threshold} />
                   </button>
                 </li>
               ))}
@@ -475,6 +478,26 @@ export default function Dashboard() {
         )}
       </main>
     </div>
+  );
+}
+
+/** Qualified or not, and why, in two or three lines. */
+function verdictOf(c: Company, threshold: number): { qualified: boolean; label: string; reason: string } {
+  const reason = c.fit_reason?.trim() || "";
+  if (c.status === "rejected") return { qualified: false, label: "Rejected by you", reason: reason || "You removed it from the shortlist." };
+  if (c.status === "shortlisted" && c.status_manual && (c.fit_score ?? 0) < threshold)
+    return { qualified: true, label: "Shortlisted by you", reason: reason ? `Scored ${c.fit_score ?? "–"}, below ${threshold}, but you shortlisted it by hand. ${reason}` : "You shortlisted it by hand." };
+  if (c.fit_score === null) return { qualified: false, label: "Not scored yet", reason: c.scrape_status === "pending" ? "Its website is being researched; it is scored as soon as that finishes." : "Not enough information yet to judge whether it fits the ICP." };
+  if (c.status === "shortlisted") return { qualified: true, label: "Qualified", reason: reason || `Scored ${c.fit_score}, at or above ${threshold}.` };
+  return { qualified: false, label: "Not qualified", reason: reason || `Scored ${c.fit_score}, below ${threshold}.` };
+}
+
+function VerdictLine({ c, threshold, lines = 3 }: { c: Company; threshold: number; lines?: 2 | 3 }) {
+  const v = verdictOf(c, threshold);
+  return (
+    <span className={`mt-3 text-xs leading-relaxed text-ink/70 ${lines === 2 ? "line-clamp-2" : "line-clamp-3"}`} title={v.reason}>
+      <span className={`font-bold ${v.qualified ? "text-emerald-700" : "text-primary"}`}>{v.label}:</span> {v.reason}
+    </span>
   );
 }
 
@@ -543,6 +566,9 @@ function QualifiedView({ companies, threshold, onOpen }: { companies: Company[];
                   <span className="min-w-0">
                     <span className={`inline-block rounded-full px-3 py-1 text-[11px] font-bold ring-1 ${tone[stage.tone]}`}>{stage.text}</span>
                     {c.thread?.status_detail && <span className="mt-1 block truncate text-xs text-ink/60">{c.thread.status_detail}</span>}
+                  </span>
+                  <span className="sm:col-span-4">
+                    <VerdictLine c={c} threshold={threshold} lines={2} />
                   </span>
                 </button>
               </li>
@@ -817,7 +843,17 @@ function Detail({ company: c, run, busy, config, rules, profile }: { company: Co
           {c.fit_score !== null && "/100"}
           {c.recommended_framework && ` · ${profile.leadWith.toLowerCase()}: ${c.recommended_framework}`}
         </p>
-        <p className="mt-2 text-sm leading-relaxed text-ink">{c.fit_reason ?? "No score yet."}</p>
+        {(() => {
+          const v = verdictOf(c, profile.threshold);
+          return (
+            <p className="mt-2 text-sm leading-relaxed text-ink">
+              <span className={`mr-2 inline-block rounded-full px-2.5 py-0.5 text-[11px] font-bold ${v.qualified ? "bg-emerald-50 text-emerald-700" : "bg-white text-primary"}`}>
+                {v.qualified ? "Why it qualifies" : v.label === "Not scored yet" ? "Not scored yet" : "Why it does not qualify"}
+              </span>
+              {v.reason}
+            </p>
+          );
+        })()}
         {!c.info_sufficient && (
           <p className="mt-3 text-sm text-ink/70">
             <strong className="text-ink">Gaps:</strong> {c.missing_info || "not enough information to judge fit confidently."}

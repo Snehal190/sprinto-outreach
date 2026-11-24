@@ -168,7 +168,10 @@ ${profile.rubric.map((r) => `- ${r}`).join("\n")}
 Set info_sufficient to false when the facts are too thin to judge ICP fit confidently, and say in
 missing_info exactly what is missing (these companies will be sent to a scraper for more data).
 recommended_framework is the ${profile.leadWith.label.toLowerCase()}: ${profile.leadWith.guide}.
-fit_reason is 1-2 plain sentences citing the specific facts behind the score.
+fit_reason explains the verdict in 2-3 plain sentences. A company qualifies at ${SHORTLIST_THRESHOLD} or more. If it
+qualifies, say which ICP criteria it meets, citing the specific facts. If it does not, say which criterion it misses
+or what caps its score (e.g. wrong business type, wrong stage, no sign of need, already has a solution), citing the facts.
+Do not restate the number.
 
 Companies:
 ${JSON.stringify(found, null, 1)}
@@ -369,7 +372,7 @@ export async function scrapeCompany(id: number) {
     // The system still has to answer, even on a forced exit: score with what it has.
     let score: Score | undefined;
     if (result.exitReason === "not_fit") {
-      score = { domain: company.domain, fit_score: 10, fit_reason: `Fails a must-have (${result.failed ?? "fit question"}): ${merged.description ?? "see website"}`, recommended_framework: "", info_sufficient: true };
+      score = { domain: company.domain, fit_score: 10, fit_reason: `Does not qualify: it fails the must-have question "${result.failed ?? "fit question"}". What its website shows: ${merged.description ?? "see the website"}`, recommended_framework: "", info_sufficient: true };
     } else if (f) {
       const answers = Object.fromEntries(profile.questions.map((q) => [q.id, f.answers?.[q.id] ?? "unknown"]));
       score = (await scoreCompanies(settings, profile, [{ ...merged, ...answers } as Found]))[0];
