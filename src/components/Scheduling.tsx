@@ -1,14 +1,65 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { field, ghostBtn, label, primaryBtn, type Notice, type Rules, type Run, type Thread } from "./shared";
 
 // After the email is sent: only where the conversation stands now. The state
 // object and every checkpoint are kept on the server (thread_events) for the
 // agent; the dashboard shows the latest status, the meeting and the reply box.
 
+// The browser's own speech recognition (Chrome, Edge, Safari). No API key and no cost.
+type Recognition = {
+  lang: string; continuous: boolean; interimResults: boolean;
+  onresult: ((e: { resultIndex: number; results: ArrayLike<{ isFinal: boolean; 0: { transcript: string } }> }) => void) | null;
+  onerror: ((e: { error: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void; stop: () => void;
+};
+
+/** Speak instead of type: appends what is said to the text, live. */
+function useDictation(setText: (update: (prev: string) => string) => void) {
+  const [listening, setListening] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  const rec = useRef<Recognition | null>(null);
+  const base = useRef("");
+
+  const stop = () => rec.current?.stop();
+  const start = (current: string) => {
+    const w = window as unknown as { SpeechRecognition?: new () => Recognition; webkitSpeechRecognition?: new () => Recognition };
+    const Ctor = w.SpeechRecognition ?? w.webkitSpeechRecognition;
+    if (!Ctor) {
+      setProblem("Voice input needs Chrome, Edge or Safari. Type the reply instead.");
+      return;
+    }
+    const r = new Ctor();
+    r.lang = "en-IN";
+    r.continuous = true;
+    r.interimResults = true;
+    base.current = current.trim() ? `${current.trim()} ` : "";
+    let finalText = "";
+    r.onresult = (e) => {
+      let interim = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const piece = e.results[i][0].transcript;
+        if (e.results[i].isFinal) finalText += piece;
+        else interim += piece;
+      }
+      setText(() => `${base.current}${finalText}${interim}`.replace(/\s+/g, " ").trimStart());
+    };
+    r.onerror = (e) => setProblem(e.error === "not-allowed" ? "Microphone access was blocked. Allow it in the browser's address bar, or type the reply." : e.error === "no-speech" ? "No speech heard. Try again closer to the microphone." : `Voice input stopped (${e.error}).`);
+    r.onend = () => setListening(false);
+    setProblem(null);
+    rec.current = r;
+    r.start();
+    setListening(true);
+  };
+  return { listening, problem, start, stop };
+}
+
 export function ThreadPanel({ thread, rules, run, busy, inbox }: { thread: Thread; rules: Rules; run: Run; busy: string | null; inbox: boolean }) {
   const [reply, setReply] = useState("");
+  const [mode, setMode] = useState<"type" | "speak">("type");
+  const dictation = useDictation(setReply);
   const working = busy !== null;
   const replyKey = `reply-${thread.id}`;
 
@@ -35,20 +86,62 @@ export function ThreadPanel({ thread, rules, run, busy, inbox }: { thread: Threa
         {thread.updated_at && <p className="mt-2 text-xs text-white/50">Updated {thread.updated_at}</p>}
       </div>
 
-      <label className="mt-5 block">
+      <div className="mt-5 flex flex-wrap items-center justify-between gap-2">
         <span className={label}>Prospect&apos;s reply</span>
-        <textarea
-          rows={3}
-          value={reply}
-          placeholder="Paste what the prospect wrote back, e.g. “Hey, running 10 min late, can we push to 3:15 instead of 3?”"
-          onChange={(e) => setReply(e.target.value)}
-          className={`${field} mt-1`}
-        />
-      </label>
+        <div className="inline-flex gap-1 rounded-full bg-mist p-1" role="group" aria-label="How to enter the reply">
+          {(["type", "speak"] as const).map((m) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => {
+                if (m === "type" && dictation.listening) dictation.stop();
+                setMode(m);
+              }}
+              aria-pressed={mode === m}
+              className={`rounded-full px-3 py-1 text-[11px] font-bold uppercase tracking-wider transition ${mode === m ? "bg-white text-primary shadow-sm" : "text-ink/60 hover:text-primary"}`}
+            >
+              {m === "type" ? "Type" : "Speak"}
+            </button>
+          ))}
+        </div>
+      </div>
+      {mode === "speak" && (
+        <div className="mt-2 flex flex-wrap items-center gap-3 rounded-2xl bg-blush px-4 py-3">
+          <button
+            type="button"
+            disabled={working}
+            onClick={() => (dictation.listening ? dictation.stop() : dictation.start(reply))}
+            aria-label={dictation.listening ? "Stop recording" : "Start recording"}
+            className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-white transition ${dictation.listening ? "animate-pulse bg-primary-dark" : "bg-primary hover:bg-primary-dark"}`}
+          >
+            {dictation.listening ? (
+              <span className="h-3 w-3 rounded-sm bg-white" />
+            ) : (
+              <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                <rect x="9" y="2" width="6" height="12" rx="3" />
+                <path d="M5 10a7 7 0 0 0 14 0M12 17v5M8 22h8" />
+              </svg>
+            )}
+          </button>
+          <span className="text-sm text-ink/80">
+            {dictation.listening ? "Listening… speak the prospect’s reply, then press stop." : "Press the microphone and say what the prospect wrote back. You can edit the text before processing it."}
+          </span>
+          {dictation.problem && <span className="w-full text-xs font-semibold text-primary">{dictation.problem}</span>}
+        </div>
+      )}
+      <textarea
+        rows={3}
+        value={reply}
+        aria-label="Prospect's reply"
+        placeholder={mode === "speak" ? "What you say appears here." : "Paste or type what the prospect wrote back, e.g. “Hey, running 10 min late, can we push to 3:15 instead of 3?”"}
+        onChange={(e) => setReply(e.target.value)}
+        className={`${field} mt-2`}
+      />
       <div className="mt-3 flex flex-wrap items-center gap-3">
         <button
           disabled={working || !reply.trim()}
           onClick={async () => {
+            if (dictation.listening) dictation.stop();
             if (await run("receiveReply", { id: thread.id, text: reply }, replyKey)) setReply("");
           }}
           className={primaryBtn}

@@ -279,13 +279,18 @@ export default function Dashboard() {
             {state.apis.map((a) => (
               <ApiPill key={a.api} status={a} />
             ))}
-            {config.google.email ? null : config.google.configured ? (
-              <a href="/api/google/connect" className="rounded-full bg-primary px-3 py-1 text-[11px] font-bold uppercase tracking-wider text-white hover:bg-primary-dark">
-                Connect Google
-              </a>
-            ) : (
-              <Pill ok={false} text="Google not set up" />
-            )}
+            {(() => {
+              // A stored sign-in that Google no longer accepts (test-mode sign-ins expire after 7 days) needs a reconnect too.
+              const g = state.apis.find((x) => x.api === "google");
+              const expired = !!config.google.email && !!g && g.checkedAt !== "" && !g.ok && !g.off;
+              if (!config.google.configured) return <Pill ok={false} text="Google not set up" />;
+              if (config.google.email && !expired) return null;
+              return (
+                <a href="/api/google/connect" title={expired ? g?.detail : undefined} className="rounded-full bg-primary px-3 py-1 text-[11px] font-bold uppercase tracking-wider text-white hover:bg-primary-dark">
+                  {expired ? "Reconnect Google" : "Connect Google"}
+                </a>
+              );
+            })()}
             <Pill ok text={config.model} />
             <div className="relative">
               <button
@@ -599,7 +604,7 @@ function ApiPill({ status }: { status: ApiStatus }) {
 function Pill({ ok, text }: { ok: boolean; text: string }) {
   return (
     <span className="inline-flex items-center gap-1.5 rounded-full border border-ink/10 bg-white px-3 py-1 text-[11px] font-semibold text-ink/80">
-      <span className={`h-1.5 w-1.5 rounded-full ${ok ? "bg-primary" : "bg-ink/30"}`} />
+      <span className={`h-1.5 w-1.5 rounded-full ${ok ? "bg-emerald-600" : "bg-ink/30"}`} />
       {text}
     </span>
   );
