@@ -289,6 +289,13 @@ function saturdaySlot(hour: number): string {
   }
   throw new Error("no Saturday found");
 }
+/** Asks for the 20-minute meeting. */
+const asks20 = (email: string) => /\b(20|twenty)[- ]?min/i.test(email);
+/** The close the user asked for: bookmark us, and we are happy to get on a call in future. */
+const bookmarkLine = (email: string) => /bookmark/i.test(email) && /\b(call|connect)/i.test(email);
+/** The wording the user does not want in an opt-out reply. */
+const saysNeverAgain = (email: string) => /(will not|won't|wont|never) (email|contact|reach out|write)/i.test(email);
+
 /** "Tue 24 Nov at 11 AM" - how a person writes a time. */
 function spoken(key: string): string {
   return formatIst(parseIst(key)!).replace(/, (\d+):00 (AM|PM) IST/, " at $1 $2").replace(/, (\d+:\d+) (AM|PM) IST/, " at $1 $2");
@@ -353,13 +360,40 @@ function scenarios(): Scenario[] {
     {
       id: "SCH-07", expect: "not_interested", setup: { reply: "Thanks, but we're not interested." },
       judge: (res) => {
+        if (res.bookings.length || res.proposals.length) return "booked or proposed slots instead of letting them pick";
+        if (res.emails.length !== 1) return `${res.emails.length} emails sent (expected 1)`;
+        const e = res.emails[0];
+        return wordCount(e) >= 80 ? `${wordCount(e)} words (expected under 80)` : asks20(e) ? null : "does not ask for 20 minutes";
+      },
+    },
+    { id: "SCH-08", expect: "", setup: {}, judge: (res) => (res.emails.length !== 1 ? `${res.emails.length} follow-up emails (expected 1)` : asks20(res.emails[0]) ? null : "the follow-up does not ask for 20 minutes") },
+    {
+      id: "SCH-14", expect: "not_interested", setup: { reply: "Appreciate it, but still not interested.", state: { persuasion_sent: true, reply_status: "not_interested" } },
+      judge: (res) => {
         if (res.bookings.length) return "booked a meeting";
         if (res.emails.length !== 1) return `${res.emails.length} emails sent (expected 1)`;
         const e = res.emails[0];
-        return wordCount(e) >= 50 ? `${wordCount(e)} words (expected under 50)` : e.includes("?") ? "asks a question in the close" : null;
+        return wordCount(e) >= 60 ? `${wordCount(e)} words (expected under 60)` : e.includes("?") ? "asks a question in the close" : asks20(e) ? "asks for a meeting again" : bookmarkLine(e) ? null : "missing the bookmark-us / happy to get on a call line";
       },
     },
-    { id: "SCH-08", expect: "", setup: {}, judge: (res) => (res.emails.length === 1 ? null : `${res.emails.length} follow-up emails (expected 1)`) },
+    {
+      id: "SCH-15", expect: "do_not_contact", setup: { reply: "Please stop emailing me." },
+      judge: (res) => {
+        if (res.bookings.length || res.proposals.length) return "tried to schedule";
+        if (res.emails.length > 1) return `${res.emails.length} emails sent (expected at most 1)`;
+        const e = res.emails[0] ?? "";
+        return e.includes("?") ? "asks a question after an opt-out" : asks20(e) ? "asks for a meeting after an opt-out" : saysNeverAgain(e) ? "says we will never email again" : e && !bookmarkLine(e) ? "missing the bookmark-us line" : null;
+      },
+    },
+    {
+      id: "SCH-17", expect: "not_now", setup: { reply: "We don't really need this right now." },
+      judge: (res) => {
+        if (res.bookings.length || res.proposals.length) return "tried to schedule";
+        if (res.emails.length !== 1) return `${res.emails.length} emails sent (expected 1)`;
+        const e = res.emails[0];
+        return asks20(e) ? "pitched a 20-minute meeting instead of closing" : e.includes("?") ? "asks a question" : bookmarkLine(e) ? null : "missing the bookmark-us / happy to get on a call line";
+      },
+    },
     {
       id: "SCH-09", expect: "other", setup: { reply: "Sorry, who is this?" },
       judge: (res) => (res.intent !== "other" ? `classified as ${res.intent}, not handed to a person` : res.emails.length || res.bookings.length ? "acted instead of handing to a person" : null),
@@ -420,6 +454,9 @@ async function scenarioChecks(): Promise<Result[]> {
     const notes = [res.intent !== "follow_up" && `intent ${res.intent}`, res.blocked.length && `guard blocked ${res.blocked.map(spoken).join(", ")}`, res.emails.length && `${res.emails.length} email(s)`].filter(Boolean).join(" · ");
     out.push(r(s.id, `"${s.setup.reply ?? "48 hours of silence"}"`, failure, null, notes));
     if (s.expect) out.push(r("SCH-13", `"${s.setup.reply}"`, res.intent === s.expect ? null : `classified as ${res.intent}, expected ${s.expect}`));
+    if (["SCH-07", "SCH-08"].includes(s.id) && res.emails[0]) {
+      out.push(r("SCH-16", `${s.id} email`, /soc ?2|security review|audit|evidence/i.test(res.emails[0]) ? null : "names none of the prospect's pain points"));
+    }
     for (const [i, e] of res.emails.entries()) {
       out.push(r("SCH-10", `${s.id} email ${i + 1}`, onlyMeetingLink(e, res.meetingLink)));
       const words = wordCount(e);

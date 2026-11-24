@@ -10,7 +10,7 @@ import { calendarBook, calendarCancel, calendarEvents, googleAccount } from "./g
 export const WORK_START_HOUR = 9;
 export const WORK_END_HOUR = 18;
 export const MAX_DAYS_AHEAD = 30;
-export const MEETING_MINUTES = 30;
+export const MEETING_MINUTES = 20;
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 

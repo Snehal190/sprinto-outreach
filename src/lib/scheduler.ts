@@ -31,10 +31,14 @@ export type State = {
   meeting_status: "unscheduled" | "pending_confirmation" | "confirmed";
   /** Whether the outcome has been written to the campaign record. */
   crm_logged: boolean;
+  /** The one persuasive "20 minutes at your convenience" email has gone out (after a "not interested" or silence). Never sent twice. */
+  persuasion_sent?: boolean;
+  /** They asked not to be contacted again. Nothing more is sent. */
+  do_not_contact?: boolean;
 };
 
 const INITIAL_STATE: State = {
-  reply_status: "no_reply", calendar_checked: false, times_proposed: [], reply_round: 0, meeting_status: "unscheduled", crm_logged: false,
+  reply_status: "no_reply", calendar_checked: false, times_proposed: [], reply_round: 0, meeting_status: "unscheduled", crm_logged: false, persuasion_sent: false, do_not_contact: false,
 };
 
 // ------------------------------------------------------------------ limits
@@ -337,8 +341,15 @@ How to handle each situation:
   If busy: call send_email asking for another time; the existing meeting stays.
 - If the requested time is on a Saturday or Sunday: do not book it. Check the same time on the next working day (Monday, or
   Friday before it) and send_email offering that weekday instead, explaining that meetings run Monday to Friday.
-- Prospect is not interested: call send_email once with a two-line polite close. No pitch, no questions.
-- Silence follow-up: call send_email once with a short, friendly nudge that adds one useful line. Do not guilt them.
+- Prospect is not interested, or has gone silent: the trigger tells you whether this is the one persuasion attempt or the close.
+  Persuasion (only once per prospect): call send_email once. Thank them, name one specific way ${ctx.seller} helps their
+  company, tied to one of their pain points, and ask for just ${MEETING_MINUTES} minutes at a time that suits them (they pick the time;
+  do not propose slots). Warm and respectful: no pressure, no guilt, no fake urgency.
+  Close (they decline again, or say they do not need it right now): call send_email once: thank them, and say they can
+  bookmark us and let us know - if we can help in the future, we are always happy to get on a call. No pitch, no question.
+- Prospect asks not to be contacted (stop, unsubscribe, remove me): call send_email once: say you are not following up for now,
+  and that they can bookmark us and let us know if they need us in the future - you would be happy to connect. Never write
+  "I will not email you again". No pitch, no question.
 
 Rules:
 - Never state that a time is free or booked unless a tool told you so in this turn.
@@ -367,7 +378,7 @@ Rules:
 
 // ------------------------------------------------------------ inbound reply
 
-type Intent = "interested" | "not_interested" | "confirms_time" | "counter_proposal" | "reschedule" | "other";
+type Intent = "interested" | "not_interested" | "not_now" | "do_not_contact" | "confirms_time" | "counter_proposal" | "reschedule" | "other";
 
 /** The branch: what kind of reply is this? One model call, no tools. Shared by real replies and the eval sandbox. */
 async function classifyReply(state: State, meetingWhen: string | null, history: string, reply: string): Promise<{ intent: Intent; reason: string }> {
@@ -389,20 +400,68 @@ Choose one intent:
 - "confirms_time": accepts one of the slots we proposed.
 - "counter_proposal": no meeting is booked yet and they name a different time of their own.
 - "reschedule": a meeting is already booked and they ask to move it, even by a few minutes.
-- "not_interested": declines, asks to stop, or says it is not relevant.
+- "not_now": says they do not need it right now - not the right time, maybe later, come back next quarter, already busy with other priorities.
+- "not_interested": declines without pointing to timing (no thanks, not relevant, not for us) - but does not ask us to stop emailing.
+- "do_not_contact": asks us to stop emailing, unsubscribe or remove them, or calls it spam.
 - "other": anything else - a question, an out-of-office, a referral to a colleague, unclear.
 
 Return JSON: {"intent": string, "reason": one short sentence}`,
     { temperature: 0, fast: true },
   );
-  const intent: Intent = ["interested", "not_interested", "confirms_time", "counter_proposal", "reschedule", "other"].includes(data.intent) ? data.intent : "other";
+  const intent: Intent = ["interested", "not_interested", "not_now", "do_not_contact", "confirms_time", "counter_proposal", "reschedule", "other"].includes(data.intent) ? data.intent : "other";
   return { intent, reason: String(data.reason ?? "") };
 }
 
-/** What the agent is told when a reply comes in. */
-function replyTrigger(thread: Thread, intent: Intent, history: string, reply: string): string {
-  return `The prospect just replied. Classified as: ${intent}.
+/**
+ * What to do with a reply, decided in code: the model writes the email, but
+ * whether we persuade, close or stop is not left to it.
+ *  - asks to stop: confirm and stop, never persuade;
+ *  - does not need it right now: the "bookmark us" close, never persuade;
+ *  - not interested, first time: the one persuasive "20 minutes" email;
+ *  - not interested after that: the "bookmark us" close, then stop;
+ *  - anything else: the normal scheduling tools.
+ */
+type ReplyMode = "stop" | "persuade" | "close" | "schedule";
+function replyMode(intent: Intent, state: State): ReplyMode {
+  if (intent === "do_not_contact") return "stop";
+  if (intent === "not_now") return "close";
+  if (intent === "not_interested") return state.persuasion_sent ? "close" : "persuade";
+  return "schedule";
+}
 
+function painLines(ctx: Ctx): string {
+  const pains: string[] = Array.isArray(ctx.contact.pain_points) ? ctx.contact.pain_points : [];
+  return pains.length ? pains.map((p, i) => `${i + 1}. ${p}`).join("\n") : "none recorded; use what the thread says about them";
+}
+
+const MODE_TEXT: Record<Exclude<ReplyMode, "schedule">, (ctx: Ctx) => string> = {
+  persuade: (ctx) => `This is the ONE persuasion attempt for this prospect. Send one email, under 80 words: thank them for replying, name one
+specific way ${ctx.seller} would help ${ctx.company.name ?? "their company"} (tie it to one of their pain points below), and ask for just
+${MEETING_MINUTES} minutes at a time that suits them. Let them pick the time; do not propose slots. Respectful, no pressure, no guilt, no fake urgency.
+Their pain points:
+${painLines(ctx)}`,
+  close: () => `This is the last email. Send a short, warm close: thank them, and say they can bookmark us and let us know - if we can
+help them in the future, we are always happy to get on a call with them. No pitch, no question, no meeting ask now.`,
+  stop: () => `They asked not to be contacted. This is the last email. In two short lines, say we are not following up for now, and
+that they can bookmark us and let us know if they need us in the future - we would be happy to connect. Do not say "I will not
+email you again" or anything like it. No pitch, no question.`,
+};
+
+/** The silence follow-up: it is the prospect's one persuasion attempt. */
+function followUpTrigger(thread: Thread, ctx: Ctx, silentHours: number, history: string): string {
+  return `The prospect has not replied for ${Math.round(silentHours)} hours. Send the one follow-up. ${MODE_TEXT.persuade(ctx)}
+
+State object: ${JSON.stringify(thread.state)}
+Slots we last proposed: ${thread.state.times_proposed.join("; ") || "none"}
+
+Thread so far:
+${history}`;
+}
+
+/** What the agent is told when a reply comes in. */
+function replyTrigger(thread: Thread, intent: Intent, history: string, reply: string, mode: ReplyMode = "schedule", ctx?: Ctx): string {
+  return `The prospect just replied. Classified as: ${intent}.
+${mode !== "schedule" && ctx ? `\n${MODE_TEXT[mode](ctx)}\n` : ""}
 State object: ${JSON.stringify(thread.state)}
 Meeting currently booked: ${thread.meeting ? `${thread.meeting.when} (${toIstInput(new Date(thread.meeting.start))}), link ${thread.meeting.link}` : "none"}
 Slots we last proposed: ${thread.state.times_proposed.join("; ") || "none"}
@@ -450,15 +509,22 @@ async function handleReply(threadId: number, text: string) {
     await flagHuman(thread, `their reply needs a person to answer ("${reply.slice(0, 120)}")`, ctx.who);
     return { intent };
   }
-  thread.state.reply_status = intent === "not_interested" ? "not_interested" : "interested";
+  const mode = replyMode(intent, thread.state);
+  thread.state.reply_status = ["not_interested", "not_now", "do_not_contact"].includes(intent) ? "not_interested" : "interested";
+  if (intent === "do_not_contact") thread.state.do_not_contact = true;
   if (intent === "counter_proposal" || intent === "reschedule") {
     // A new time is on the table: the calendar has not been checked for it yet.
     thread.state.calendar_checked = false;
     thread.state.reply_round += 1;
   }
-  await checkpoint(thread, "branch", `Branch: prospect ${intent.replace("_", " ")} (${data.reason})`);
+  await checkpoint(thread, "branch", `Branch: prospect ${intent.replace(/_/g, " ")} (${data.reason})${mode === "persuade" ? " → one persuasion email" : mode === "close" ? " → polite close" : mode === "stop" ? " → confirm and stop" : ""}`);
 
-  const run = await runAgent(thread, ctx, replyTrigger(thread, intent, history, reply), intent === "not_interested" ? ["send_email"] : TOOLS.map((t) => t.name));
+  const run = await runAgent(thread, ctx, replyTrigger(thread, intent, history, reply, mode, ctx), mode === "schedule" ? TOOLS.map((t) => t.name) : ["send_email"]);
+  if (mode === "persuade" && run.emails > 0) {
+    // The one persuasion attempt is spent: no silence nudge after it; a human takes over if they stay silent.
+    thread.state.persuasion_sent = true;
+    await sql(`UPDATE threads SET follow_up_sent_at = now() WHERE id = $1`, [threadId]);
+  }
 
   // Safety nets, in code: the outcome must not depend on the model remembering the last step.
   if (run.booked && !run.emailedAfterBooking && thread.meeting) {
@@ -468,8 +534,9 @@ async function handleReply(threadId: number, text: string) {
       "Meeting link sent", ctx.contact.email ?? null,
     );
   }
-  if (thread.state.meeting_status === "confirmed" || thread.state.reply_status === "not_interested") thread.state.crm_logged = true;
-  if (intent === "not_interested") await sql(`UPDATE threads SET awaiting_reply = FALSE WHERE id = $1`, [threadId]);
+  const finished = mode === "close" || mode === "stop";
+  if (thread.state.meeting_status === "confirmed" || finished) thread.state.crm_logged = true;
+  if (finished) await sql(`UPDATE threads SET awaiting_reply = FALSE WHERE id = $1`, [threadId]);
   if (thread.state.meeting_status === "confirmed") await sql(`UPDATE threads SET awaiting_reply = FALSE WHERE id = $1`, [threadId]);
   await checkpoint(thread, "branch", thread.state.crm_logged ? "Outcome logged to the campaign record" : "Turn finished");
   if (run.calls === 0 || (run.emails === 0 && !run.booked)) {
@@ -546,12 +613,13 @@ export async function runTimers(force = false) {
       const ctx = await context(thread);
       if (!thread.follow_up_sent_at && silentHours >= FOLLOW_UP_AFTER_HOURS) {
         await requireApis(["gemini", ...(await mailApi())]);
-        const run = await runAgent(
-          thread, ctx,
-          `The prospect has not replied for ${Math.round(silentHours)} hours. Send the one follow-up.\n\nState object: ${JSON.stringify(thread.state)}\nSlots we last proposed: ${thread.state.times_proposed.join("; ") || "none"}\n\nThread so far:\n${await conversationText(thread.id)}`,
-          ["send_email"],
-        );
-        if (run.emails > 0) await sql(`UPDATE threads SET follow_up_sent_at = now() WHERE id = $1`, [thread.id]);
+        if (thread.state.do_not_contact) continue;
+        const run = await runAgent(thread, ctx, followUpTrigger(thread, ctx, silentHours, await conversationText(thread.id)), ["send_email"]);
+        if (run.emails > 0) {
+          thread.state.persuasion_sent = true;
+          await checkpoint(thread, "branch", "Silence follow-up sent (the one persuasion email)");
+          await sql(`UPDATE threads SET follow_up_sent_at = now() WHERE id = $1`, [thread.id]);
+        }
         else await flagHuman(thread, "the follow-up could not be sent", ctx.who);
       } else if (thread.follow_up_sent_at && silentHours >= CONCLUDE_AFTER_HOURS) {
         await flagHuman(thread, `no reply ${CONCLUDE_AFTER_HOURS} hours after the follow-up`, ctx.who);
@@ -600,7 +668,8 @@ function statusLabel(t: Row): string {
   const s = t.state as State;
   if (t.needs_human) return "Needs you";
   if (s.meeting_status === "confirmed") return meetingDone(t) ? "Meeting done" : "Meeting booked";
-  if (s.reply_status === "not_interested") return "Not interested";
+  if (s.do_not_contact) return "Asked not to be contacted";
+  if (s.reply_status === "not_interested") return t.awaiting_reply ? "Not interested · follow-up sent" : "Not interested";
   if (s.meeting_status === "pending_confirmation") return "Waiting for them to confirm a time";
   if (s.reply_status === "interested") return "In conversation";
   return t.follow_up_sent_at ? "Follow-up sent, waiting" : "Waiting for a reply";
@@ -707,7 +776,11 @@ export async function sandboxRun(setup: SandboxSetup): Promise<SandboxResult> {
   } as Thread;
   if (setup.meetingAt) thread.state.meeting_status = "confirmed";
   const ctx: Ctx = {
-    company: { name: "Acme Test Co" }, contact: { first_name: "Alex", last_name: "Rivera", title: "CTO", email: null },
+    company: { name: "Acme Test Co" },
+    contact: {
+      first_name: "Alex", last_name: "Rivera", title: "CTO", email: null,
+      pain_points: ["Enterprise deals are stalling in security review because Acme has no SOC 2 report yet.", "Two engineers are losing weeks to collecting audit evidence by hand."],
+    },
     sender: settings.senderName || "Sam", seller: settings.companyName, product: `${settings.companyName}: ${settings.product}`, who: "Alex Rivera (Acme Test Co)",
   };
   const history = `[US]\nHi Alex,\n\nA short note from ${ctx.seller} about ${settings.product.slice(0, 120)}.\n\nWorth a quick call?\n\n${ctx.sender}`;
@@ -716,17 +789,18 @@ export async function sandboxRun(setup: SandboxSetup): Promise<SandboxResult> {
   });
   try {
     if (!setup.reply) {
-      const run = await runAgent(thread, ctx, `The prospect has not replied for ${FOLLOW_UP_AFTER_HOURS} hours. Send the one follow-up.\n\nState object: ${JSON.stringify(thread.state)}\nSlots we last proposed: ${thread.state.times_proposed.join("; ") || "none"}\n\nThread so far:\n${history}`, ["send_email"], io);
+      const run = await runAgent(thread, ctx, followUpTrigger(thread, ctx, FOLLOW_UP_AFTER_HOURS, history), ["send_email"], io);
       return out("follow_up", "", run.emails === 0);
     }
     const { intent, reason } = await classifyReply(thread.state, thread.meeting?.when ?? null, history, setup.reply);
     if (intent === "other") return out(intent, reason, true);
-    thread.state.reply_status = intent === "not_interested" ? "not_interested" : "interested";
+    const mode = replyMode(intent, thread.state);
+    thread.state.reply_status = ["not_interested", "not_now", "do_not_contact"].includes(intent) ? "not_interested" : "interested";
     if (intent === "counter_proposal" || intent === "reschedule") {
       thread.state.calendar_checked = false;
       thread.state.reply_round += 1;
     }
-    const run = await runAgent(thread, ctx, replyTrigger(thread, intent, history, setup.reply), intent === "not_interested" ? ["send_email"] : TOOLS.map((t) => t.name), io);
+    const run = await runAgent(thread, ctx, replyTrigger(thread, intent, history, setup.reply, mode, ctx), mode === "schedule" ? TOOLS.map((t) => t.name) : ["send_email"], io);
     // The same safety net as a real reply: a booking always ends with the link going out.
     if (run.booked && !run.emailedAfterBooking && thread.meeting) emails.push(`Hi Alex,\n\nYou're booked for ${thread.meeting.when}.\n\nMeeting link: ${thread.meeting.link}\n\nSee you then.\n\n${ctx.sender}`);
     return out(intent, reason, run.calls === 0 || (run.emails === 0 && !run.booked));
